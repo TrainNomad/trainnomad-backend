@@ -356,6 +356,46 @@ app.get('/api/trains/debug', async (req, res) => {
     }
 });
 
+// Exemple de route pour rechercher un trajet : /recherche?depart=Rennes&arrivee=Paris&date=20240520
+app.get('/recherche', async (req, res) => {
+    const { depart, arrivee, date } = req.query;
+
+    if (!depart || !arrivee || !date) {
+        return res.status(400).json({ error: "Paramètres depart, arrivee et date requis." });
+    }
+
+    // Cette requête fait tout le travail de jointure GTFS
+    const { data, error } = await supabase
+        .from('stop_times')
+        .select(`
+            trip_id,
+            departure_time,
+            stop:stops!stop_id (stop_name),
+            trips!inner (
+                route_id,
+                route:routes (route_short_name, route_long_name),
+                calendar:calendar_dates!inner (date)
+            ),
+            destination:stop_times!inner (
+                arrival_time,
+                stop:stops!stop_id (stop_name)
+            )
+        `)
+        // 1. Filtrer par le nom de la gare de départ
+        .eq('stop.stop_name', depart)
+        // 2. Filtrer par le nom de la gare d'arrivée (via la jointure destination)
+        .eq('destination.stop.stop_name', arrivee)
+        // 3. Filtrer par la date (format YYYYMMDD souvent dans le GTFS)
+        .eq('trips.calendar.date', date)
+        // 4. S'assurer que le départ est AVANT l'arrivée dans le trajet
+        .lt('stop_sequence', 'destination.stop_sequence') 
+        .order('departure_time', { ascending: true });
+
+    if (error) return res.status(500).json(error);
+    res.json(data);
+});
+
+
 // Version SIMPLIFIÉE de la recherche (sans debug)
 app.get('/api/trains', async (req, res) => {
     try {
