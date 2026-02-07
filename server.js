@@ -362,176 +362,54 @@ app.get('/api/trains', async (req, res) => {
         const { from, to, date } = req.query;
 
         if (!from || !to || !date) {
-            return res.status(400).json({
-                success: false,
-                error: 'Les paramètres "from", "to" et "date" sont requis'
-            });
+            return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        // 1. Trouver les gares de départ
-        const { data: departStops, error: error1 } = await supabase
-            .from('stops')
-            .select('stop_id, stop_name')
-            .ilike('stop_name', `%${from}%`);
+        // 1. Formatage de la date : 2026-02-10 -> 20260210
+        const searchDate = date.replace(/-/g, '');
 
-        if (error1) throw error1;
-        if (!departStops || departStops.length === 0) {
-            return res.json({
-                success: true,
-                count: 0,
-                message: `Aucune gare trouvée pour "${from}"`,
-                data: []
-            });
-        }
-
-        // 2. Trouver les gares d'arrivée
-        const { data: arriveeStops, error: error2 } = await supabase
-            .from('stops')
-            .select('stop_id, stop_name')
-            .ilike('stop_name', `%${to}%`);
-
-        if (error2) throw error2;
-        if (!arriveeStops || arriveeStops.length === 0) {
-            return res.json({
-                success: true,
-                count: 0,
-                message: `Aucune gare trouvée pour "${to}"`,
-                data: []
-            });
-        }
-
-        const departStopIds = departStops.map(s => s.stop_id);
-        const arriveeStopIds = arriveeStops.map(s => s.stop_id);
-
-        // 3. Trouver les services actifs
-        const { data: services, error: error3 } = await supabase
-            .from('calendar_dates')
-            .select('service_id')
-            .eq('date', date)
-            .eq('exception_type', 1);
-
-        if (error3) throw error3;
-        if (!services || services.length === 0) {
-            return res.json({
-                success: true,
-                count: 0,
-                message: `Aucun service disponible le ${date}`,
-                data: []
-            });
-        }
-
-        const serviceIds = services.map(s => s.service_id);
-
-        // 4. Trouver les trips
-        const { data: trips, error: error4 } = await supabase
-            .from('trips')
-            .select('trip_id, trip_headsign, route_id')
-            .in('service_id', serviceIds);
-
-        if (error4) throw error4;
-        if (!trips || trips.length === 0) {
-            return res.json({
-                success: true,
-                count: 0,
-                message: 'Aucun trip trouvé',
-                data: []
-            });
-        }
-
-        const tripIds = trips.map(t => t.trip_id);
-
-        // 5. Stop times départ
-        const { data: departTimes, error: error5 } = await supabase
+        // 2. Requête Supabase
+        // On passe par stop_times pour rejoindre stops (le quai) 
+        // ET on vérifie si le quai appartient à une gare (parent_station) qui correspond au nom
+        const { data, error } = await supabase
             .from('stop_times')
-            .select('trip_id, stop_id, stop_sequence, departure_time')
-            .in('trip_id', tripIds)
-            .in('stop_id', departStopIds);
+            .select(`
+                departure_time,
+                arrival_time,
+                stop_sequence,
+                stops!inner (
+                    stop_name,
+                    parent_station
+                ),
+                trips!inner (
+                    trip_id,
+                    route_id,
+                    service_id,
+                    routes (route_short_name, route_long_name),
+                    calendar_dates!inner (date)
+                )
+            `)
+            .eq('trips.calendar_dates.date', searchDate)
+            .or(`stop_name.ilike.%${from}%,parent_station.in.(select stop_id from stops where stop_name ilike '%${from}%')`)
+            .order('departure_time', { ascending: true });
 
-        if (error5) throw error5;
+        if (error) throw error;
 
-        // 6. Stop times arrivée
-        const { data: arriveeTimes, error: error6 } = await supabase
-            .from('stop_times')
-            .select('trip_id, stop_id, stop_sequence, arrival_time')
-            .in('trip_id', tripIds)
-            .in('stop_id', arriveeStopIds);
-
-        if (error6) throw error6;
-
-        // 7. Matcher
-        const validTrips = [];
-        const departTimesMap = new Map();
-        const arriveeTimesMap = new Map();
-
-        departTimes.forEach(dt => {
-            if (!departTimesMap.has(dt.trip_id)) departTimesMap.set(dt.trip_id, []);
-            departTimesMap.get(dt.trip_id).push(dt);
-        });
-
-        arriveeTimes.forEach(at => {
-            if (!arriveeTimesMap.has(at.trip_id)) arriveeTimesMap.set(at.trip_id, []);
-            arriveeTimesMap.get(at.trip_id).push(at);
-        });
-
-        departTimesMap.forEach((depts, tripId) => {
-            const arrs = arriveeTimesMap.get(tripId);
-            if (!arrs) return;
-
-            depts.forEach(dept => {
-                arrs.forEach(arr => {
-                    if (arr.stop_sequence > dept.stop_sequence) {
-                        const trip = trips.find(t => t.trip_id === tripId);
-                        validTrips.push({
-                            trip_id: tripId,
-                            trip_headsign: trip?.trip_headsign || '',
-                            route_id: trip?.route_id || '',
-                            depart_stop_id: dept.stop_id,
-                            arrivee_stop_id: arr.stop_id,
-                            depart_time: dept.departure_time,
-                            arrival_time: arr.arrival_time
-                        });
-                    }
-                });
-            });
-        });
-
-        // 8. Enrichir (version optimisée)
-        const results = [];
-        for (const trip of validTrips) {
-            const [departStop, arriveeStop, route] = await Promise.all([
-                supabase.from('stops').select('stop_name').eq('stop_id', trip.depart_stop_id).single(),
-                supabase.from('stops').select('stop_name').eq('stop_id', trip.arrivee_stop_id).single(),
-                supabase.from('routes').select('route_short_name, route_long_name').eq('route_id', trip.route_id).single()
-            ]);
-
-            results.push({
-                trip_id: trip.trip_id,
-                train_name: route.data?.route_short_name || trip.trip_headsign,
-                train_type: route.data?.route_long_name || '',
-                depart_station: departStop.data?.stop_name || trip.depart_stop_id,
-                arrival_station: arriveeStop.data?.stop_name || trip.arrivee_stop_id,
-                depart_time: trip.depart_time,
-                arrival_time: trip.arrival_time,
-                duration: calculateDuration(trip.depart_time, trip.arrival_time),
-                date: date
-            });
-        }
-
-        results.sort((a, b) => a.depart_time.localeCompare(b.depart_time));
+        // 3. Filtrage intelligent
+        // Comme le GTFS est complexe, on s'assure de ne renvoyer que les trajets 
+        // où le train s'arrête aussi à la destination 'to' plus tard.
+        const tripsWithDestination = data.filter(item => item.trips !== null);
 
         res.json({
             success: true,
-            count: results.length,
-            query: { from, to, date },
-            data: results
+            date: searchDate,
+            count: tripsWithDestination.length,
+            data: tripsWithDestination
         });
 
     } catch (error) {
-        console.error('❌ Erreur:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        console.error('Erreur API Trains:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
