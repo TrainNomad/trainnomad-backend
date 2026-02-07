@@ -94,27 +94,35 @@ app.get('/api/trains', async (req, res) => {
         const { from, to, date } = req.query;
 
         if (!from || !to || !date) {
-            return res.status(400).json({ error: "Paramètres manquants" });
+            return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        console.log(`🔍 Recherche optimisée : ${from} -> ${to} le ${date}`);
+        // 1. Récupérer les services actifs pour la date (ex: 2026-02-10)
+        // On ne fait pas de join, on récupère juste la liste des IDs
+        const { data: activeServices, error: sError } = await supabase
+            .from('calendar_dates')
+            .select('service_id')
+            .eq('date', date)
+            .eq('exception_type', 1);
 
-        // 1. Trouver les IDs des gares (Départ et Arrivée)
+        if (sError) throw sError;
+        
+        const serviceIds = activeServices.map(s => s.service_id);
+        if (serviceIds.length === 0) {
+            return res.json({ success: true, count: 0, message: "Aucun service trouvé pour cette date" });
+        }
+
+        // 2. Trouver les IDs des gares de départ et d'arrivée
         const { data: stops } = await supabase
             .from('stops')
             .select('stop_id, stop_name')
             .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
 
-        const departStopIds = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
-        const arriveeStopIds = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
+        const depIds = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
+        const arrIds = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
 
-        if (departStopIds.length === 0 || arriveeStopIds.length === 0) {
-            return res.json({ success: true, count: 0, message: "Gares non trouvées" });
-        }
-
-        // 2. LA REQUÊTE MAGIQUE : Une seule requête pour tout lier
-        // On part de stop_times, on lie les trips, les routes et on vérifie le calendrier
-        const { data: results, error } = await supabase
+        // 3. La requête principale : on filtre sur les serviceIds récupérés à l'étape 1
+        const { data: results, error: rError } = await supabase
             .from('stop_times')
             .select(`
                 trip_id,
@@ -122,58 +130,43 @@ app.get('/api/trains', async (req, res) => {
                 departure_time,
                 stop_sequence,
                 stop_id,
-                stops (stop_name),
+                stops(stop_name),
                 trips!inner (
                     trip_headsign,
                     route_id,
-                    routes (route_short_name, route_long_name),
-                    calendar_dates!inner (date, exception_type)
+                    service_id,
+                    routes(route_short_name, route_long_name)
                 )
             `)
-            .in('stop_id', [...departStopIds, ...arriveeStopIds])
-            .eq('trips.calendar_dates.date', date) // Utilise bien le format YYYY-MM-DD de votre image
-            .eq('trips.calendar_dates.exception_type', 1);
+            .in('stop_id', [...depIds, ...arrIds])
+            .in('trips.service_id', serviceIds); // C'est ici qu'on fait la liaison "manuelle"
 
-        if (error) throw error;
+        if (rError) throw rError;
 
-        // 3. Réorganiser les données pour coupler les départs et arrivées
+        // 4. Groupement par trajet (Départ -> Arrivée)
         const tripsMap = {};
         results.forEach(row => {
-            if (!tripsMap[row.trip_id]) {
-                tripsMap[row.trip_id] = { departure: null, arrival: null };
-            }
-            
-            if (departStopIds.includes(row.stop_id)) {
-                tripsMap[row.trip_id].departure = row;
-            } else if (arriveeStopIds.includes(row.stop_id)) {
-                tripsMap[row.trip_id].arrival = row;
-            }
+            if (!tripsMap[row.trip_id]) tripsMap[row.trip_id] = { dep: null, arr: null };
+            if (depIds.includes(row.stop_id)) tripsMap[row.trip_id].dep = row;
+            else if (arrIds.includes(row.stop_id)) tripsMap[row.trip_id].arr = row;
         });
 
-        // 4. Filtrer les trajets valides (Départ avant Arrivée) et formater
-        const finalTrains = Object.values(tripsMap)
-            .filter(t => t.departure && t.arrival && t.departure.stop_sequence < t.arrival.stop_sequence)
+        const trains = Object.values(tripsMap)
+            .filter(t => t.dep && t.arr && t.dep.stop_sequence < t.arr.stop_sequence)
             .map(t => ({
-                trip_id: t.departure.trip_id,
-                train_number: t.departure.trips.routes.route_short_name || 'N/A',
-                train_type: t.departure.trips.routes.route_long_name || t.departure.trips.trip_headsign,
-                depart_station: t.departure.stops.stop_name,
-                arrival_station: t.arrival.stops.stop_name,
-                depart_time: t.departure.departure_time,
-                arrival_time: t.arrival.arrival_time,
-                duration: calculateDuration(t.departure.departure_time, t.arrival.arrival_time)
+                train_number: t.dep.trips.routes.route_short_name || 'N/A',
+                type: t.dep.trips.routes.route_long_name || t.dep.trips.trip_headsign,
+                departure_station: t.dep.stops.stop_name,
+                arrival_station: t.arr.stops.stop_name,
+                departure_time: t.dep.departure_time,
+                arrival_time: t.arr.arrival_time,
+                duration: calculateDuration(t.dep.departure_time, t.arr.arrival_time)
             }))
-            .sort((a, b) => a.depart_time.localeCompare(b.depart_time));
+            .sort((a, b) => a.departure_time.localeCompare(b.departure_time));
 
-        res.json({
-            success: true,
-            count: finalTrains.length,
-            date: date,
-            trains: finalTrains
-        });
+        res.json({ success: true, count: trains.length, date, trains });
 
     } catch (error) {
-        console.error('💥 Erreur:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
