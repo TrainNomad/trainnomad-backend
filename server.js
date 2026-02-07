@@ -97,12 +97,17 @@ app.get('/api/trains', async (req, res) => {
             return res.status(400).json({ 
                 success: false,
                 error: "Paramètres from, to et date requis",
-                example: "/api/trains?from=Paris&to=Nantes&date=20260210"
+                example: "/api/trains?from=Paris&to=Nantes&date=2026-02-10"
             });
         }
 
-        // 1. Formatage de la date (enlever les tirets si présents)
-        const searchDate = date.replace(/-/g, '');
+        // 1. Formatage de la date : convertir vers le format de la BDD (avec tirets)
+        // Si l'utilisateur envoie 20260210, on le convertit en 2026-02-10
+        let searchDate = date;
+        if (date.length === 8 && !date.includes('-')) {
+            // Format YYYYMMDD -> YYYY-MM-DD
+            searchDate = `${date.substring(0, 4)}-${date.substring(4, 6)}-${date.substring(6, 8)}`;
+        }
 
         console.log('🔍 Recherche:', { from, to, date: searchDate });
 
@@ -142,19 +147,33 @@ app.get('/api/trains', async (req, res) => {
         console.log('📍 Gares départ:', departStopIds.length);
         console.log('📍 Gares arrivée:', arriveeStopIds.length);
 
-        // 4. Trouver les services actifs pour cette date
+        // 4. Trouver les services actifs pour cette date (format YYYY-MM-DD)
+        console.log('🔍 Recherche services pour la date:', searchDate);
+        
         const { data: services, error: error3 } = await supabase
             .from('calendar_dates')
-            .select('service_id')
+            .select('service_id, exception_type, date')
             .eq('date', searchDate)
             .eq('exception_type', 1); // 1 = service actif
 
         if (error3) throw error3;
+        
         if (!services || services.length === 0) {
+            // Donnons plus d'infos pour debug
+            const { data: sampleDates } = await supabase
+                .from('calendar_dates')
+                .select('date, exception_type')
+                .limit(5);
+            
             return res.json({
                 success: true,
                 count: 0,
-                message: `Aucun service disponible le ${searchDate}`
+                message: `Aucun service disponible le ${searchDate}`,
+                debug: {
+                    searchedDate: searchDate,
+                    sampleDatesInDB: sampleDates,
+                    hint: "Vérifiez que la date existe dans calendar_dates avec exception_type=1"
+                }
             });
         }
 
@@ -287,6 +306,55 @@ app.get('/api/trains', async (req, res) => {
     }
 });
 
+// Route de debug pour vérifier les dates
+app.get('/api/debug/dates', async (req, res) => {
+    try {
+        const { date } = req.query;
+
+        // 1. Voir quelques exemples de dates
+        const { data: sampleDates } = await supabase
+            .from('calendar_dates')
+            .select('date, exception_type, service_id')
+            .limit(10);
+
+        // 2. Si une date est fournie, chercher autour
+        let searchResults = null;
+        if (date) {
+            const searchDate = date.replace(/-/g, '');
+            const { data } = await supabase
+                .from('calendar_dates')
+                .select('date, exception_type, service_id')
+                .ilike('date', `%${searchDate}%`);
+            searchResults = data;
+        }
+
+        // 3. Compter par type d'exception
+        const { data: exceptionCounts } = await supabase
+            .from('calendar_dates')
+            .select('exception_type')
+            .limit(1000);
+
+        const counts = {};
+        exceptionCounts?.forEach(e => {
+            counts[e.exception_type] = (counts[e.exception_type] || 0) + 1;
+        });
+
+        res.json({
+            success: true,
+            sampleDates: sampleDates,
+            searchResults: searchResults,
+            exceptionTypeCounts: counts,
+            hint: "Vérifiez le format des dates. GTFS utilise YYYYMMDD (ex: 20260210)"
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Liste des stations
 app.get('/api/stations', async (req, res) => {
     try {
@@ -345,8 +413,9 @@ app.use((req, res) => {
         availableRoutes: [
             'GET /',
             'GET /health',
-            'GET /api/trains?from=Paris&to=Nantes&date=20260210',
-            'GET /api/stations?search=Paris'
+            'GET /api/trains?from=Paris&to=Nantes&date=2026-02-10',
+            'GET /api/stations?search=Paris',
+            'GET /api/debug/dates?date=2026-02-10'
         ]
     });
 });
