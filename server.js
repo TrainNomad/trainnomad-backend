@@ -306,6 +306,53 @@ app.get('/api/trains', async (req, res) => {
     }
 });
 
+// Route pour voir les dates disponibles
+app.get('/api/available-dates', async (req, res) => {
+    try {
+        // Récupérer toutes les dates uniques
+        const { data: dates, error } = await supabase
+            .from('calendar_dates')
+            .select('date')
+            .eq('exception_type', 1)
+            .order('date', { ascending: true });
+
+        if (error) throw error;
+
+        // Extraire les dates uniques
+        const uniqueDates = [...new Set(dates.map(d => d.date))];
+
+        // Trouver min et max
+        const minDate = uniqueDates[0];
+        const maxDate = uniqueDates[uniqueDates.length - 1];
+
+        // Grouper par mois
+        const byMonth = {};
+        uniqueDates.forEach(date => {
+            const month = date.substring(0, 7); // YYYY-MM
+            if (!byMonth[month]) byMonth[month] = [];
+            byMonth[month].push(date);
+        });
+
+        res.json({
+            success: true,
+            dateRange: {
+                first: minDate,
+                last: maxDate,
+                totalDays: uniqueDates.length
+            },
+            byMonth: byMonth,
+            sampleDates: uniqueDates.slice(0, 10),
+            message: `Données disponibles du ${minDate} au ${maxDate}`
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // Route de debug pour vérifier les dates
 app.get('/api/debug/dates', async (req, res) => {
     try {
@@ -413,9 +460,10 @@ app.use((req, res) => {
         availableRoutes: [
             'GET /',
             'GET /health',
-            'GET /api/trains?from=Paris&to=Nantes&date=2026-02-10',
+            'GET /api/available-dates',
+            'GET /api/trains?from=Paris&to=Nantes&date=2026-07-10',
             'GET /api/stations?search=Paris',
-            'GET /api/debug/dates?date=2026-02-10'
+            'GET /api/debug/dates?date=2026-07-10'
         ]
     });
 });
