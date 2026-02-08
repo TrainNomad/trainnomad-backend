@@ -97,8 +97,7 @@ app.get('/api/trains', async (req, res) => {
             return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        // 1. Récupérer les services actifs pour la date (ex: 2026-02-10)
-        // On ne fait pas de join, on récupère juste la liste des IDs
+        // 1. Récupérer les services actifs pour la date
         const { data: activeServices, error: sError } = await supabase
             .from('calendar_dates')
             .select('service_id')
@@ -112,7 +111,7 @@ app.get('/api/trains', async (req, res) => {
             return res.json({ success: true, count: 0, message: "Aucun service trouvé pour cette date" });
         }
 
-        // 2. Trouver les IDs des gares de départ et d'arrivée
+        // 2. Trouver les IDs des gares
         const { data: stops } = await supabase
             .from('stops')
             .select('stop_id, stop_name')
@@ -121,7 +120,7 @@ app.get('/api/trains', async (req, res) => {
         const depIds = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
         const arrIds = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
 
-        // 3. La requête principale : on filtre sur les serviceIds récupérés à l'étape 1
+        // 3. Requête principale
         const { data: results, error: rError } = await supabase
             .from('stop_times')
             .select(`
@@ -139,11 +138,11 @@ app.get('/api/trains', async (req, res) => {
                 )
             `)
             .in('stop_id', [...depIds, ...arrIds])
-            .in('trips.service_id', serviceIds); // C'est ici qu'on fait la liaison "manuelle"
+            .in('trips.service_id', serviceIds);
 
         if (rError) throw rError;
 
-        // 4. Groupement par trajet (Départ -> Arrivée)
+        // 4. Groupement par trajet
         const tripsMap = {};
         results.forEach(row => {
             if (!tripsMap[row.trip_id]) tripsMap[row.trip_id] = { dep: null, arr: null };
@@ -154,8 +153,10 @@ app.get('/api/trains', async (req, res) => {
         const trains = Object.values(tripsMap)
             .filter(t => t.dep && t.arr && t.dep.stop_sequence < t.arr.stop_sequence)
             .map(t => ({
-                train_number: t.dep.trips.routes.route_short_name || 'N/A',
-                type: t.dep.trips.routes.route_long_name || t.dep.trips.trip_headsign,
+                // MODIFICATION ICI : On utilise trip_headsign à la place de route_short_name
+                train_number: t.dep.trips.trip_headsign || t.dep.trips.routes.route_short_name || 'N/A',
+                
+                type: t.dep.trips.routes.route_long_name || "Train",
                 departure_station: t.dep.stops.stop_name,
                 arrival_station: t.arr.stops.stop_name,
                 departure_time: t.dep.departure_time,
