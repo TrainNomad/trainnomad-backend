@@ -100,14 +100,11 @@ app.get('/api/trains/search', async (req, res) => {
             });
         }
 
-        // Convertir la date au format GTFS (YYYYMMDD)
-        const gtfsDate = date.replace(/-/g, '');
-
         // 1. Récupérer les services actifs pour la date
         const { data: activeServices, error: sError } = await supabase
             .from('calendar_dates')
             .select('service_id')
-            .eq('date', gtfsDate)
+            .eq('date', date)
             .eq('exception_type', 1);
 
         if (sError) throw sError;
@@ -118,7 +115,7 @@ app.get('/api/trains/search', async (req, res) => {
                 success: true, 
                 count: 0, 
                 message: "Aucun service trouvé pour cette date",
-                hint: `Format de date testé: ${gtfsDate}`
+                hint: `Format de date testé: ${date}`
             });
         }
 
@@ -434,14 +431,11 @@ app.get('/api/trains', async (req, res) => {
             return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        // Convertir la date au format GTFS
-        const gtfsDate = date.replace(/-/g, '');
-
         // 1. Récupérer les services actifs pour la date
         const { data: activeServices, error: sError } = await supabase
             .from('calendar_dates')
             .select('service_id')
-            .eq('date', gtfsDate)
+            .eq('date', date)
             .eq('exception_type', 1);
 
         if (sError) throw sError;
@@ -542,6 +536,64 @@ app.get('/api/available-dates', async (req, res) => {
             byMonth: byMonth,
             sampleDates: uniqueDates.slice(0, 10),
             message: `Données disponibles du ${minDate} au ${maxDate}`
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Route de debug pour vérifier les dates
+app.get('/api/debug/dates', async (req, res) => {
+    try {
+        const { date } = req.query;
+
+        // 1. Voir quelques exemples de dates
+        const { data: sampleDates } = await supabase
+            .from('calendar_dates')
+            .select('date, exception_type, service_id')
+            .limit(10);
+
+        // 2. Si une date est fournie, chercher avec différents formats
+        let searchResults = {};
+        if (date) {
+            // Tester plusieurs formats
+            const formats = {
+                'original': date,
+                'sans_tirets': date.replace(/-/g, ''),
+                'avec_tirets': date.includes('-') ? date : `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)}`
+            };
+
+            for (const [formatName, testDate] of Object.entries(formats)) {
+                const { data } = await supabase
+                    .from('calendar_dates')
+                    .select('date, exception_type, service_id')
+                    .eq('date', testDate)
+                    .limit(5);
+                searchResults[formatName] = data;
+            }
+        }
+
+        // 3. Compter par type d'exception
+        const { data: exceptionCounts } = await supabase
+            .from('calendar_dates')
+            .select('exception_type')
+            .limit(1000);
+
+        const counts = {};
+        exceptionCounts?.forEach(e => {
+            counts[e.exception_type] = (counts[e.exception_type] || 0) + 1;
+        });
+
+        res.json({
+            success: true,
+            sampleDates: sampleDates,
+            searchResults: searchResults,
+            exceptionTypeCounts: counts,
+            hint: "Vérifiez le format des dates dans sampleDates"
         });
 
     } catch (error) {
