@@ -90,6 +90,7 @@ app.get('/health', async (req, res) => {
 // ROUTE PRINCIPALE DE RECHERCHE (Directs + Correspondances)
 // ===================================
 app.get('/api/trains', async (req, res) => {
+    const { from, to, date, startTime = "00:00:00", limit = 8 } = req.query;
     try {
         const { from, to, date, maxTransfers = 1, minTransferTime = 30 } = req.query;
 
