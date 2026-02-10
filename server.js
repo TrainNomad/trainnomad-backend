@@ -87,16 +87,16 @@ app.get('/health', async (req, res) => {
 });
 
 // ===================================
-// NOUVELLE ROUTE AVEC CORRESPONDANCES
+// ROUTE PRINCIPALE DE RECHERCHE (Directs + Correspondances)
 // ===================================
-app.get('/api/trains/search', async (req, res) => {
+app.get('/api/trains', async (req, res) => {
     try {
         const { from, to, date, maxTransfers = 1, minTransferTime = 30 } = req.query;
 
         if (!from || !to || !date) {
             return res.status(400).json({ 
                 error: "Paramètres from, to et date requis",
-                example: "/api/trains/search?from=Paris&to=Marseille&date=2026-07-10&maxTransfers=1"
+                example: "/api/trains?from=Paris&to=Nantes&date=2026-07-10&maxTransfers=1&minTransferTime=30"
             });
         }
 
@@ -111,12 +111,7 @@ app.get('/api/trains/search', async (req, res) => {
         
         const serviceIds = activeServices.map(s => s.service_id);
         if (serviceIds.length === 0) {
-            return res.json({ 
-                success: true, 
-                count: 0, 
-                message: "Aucun service trouvé pour cette date",
-                hint: `Format de date testé: ${date}`
-            });
+            return res.json({ success: true, count: 0, message: "Aucun service trouvé pour cette date" });
         }
 
         // 2. Trouver les IDs des gares
@@ -125,73 +120,111 @@ app.get('/api/trains/search', async (req, res) => {
             .select('stop_id, stop_name')
             .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
 
-        const originStops = stops.filter(s => 
-            s.stop_name.toLowerCase().includes(from.toLowerCase())
-        );
-        const destStops = stops.filter(s => 
-            s.stop_name.toLowerCase().includes(to.toLowerCase())
-        );
+        const depIds = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
+        const arrIds = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
 
-        if (originStops.length === 0 || destStops.length === 0) {
+        if (depIds.length === 0 || arrIds.length === 0) {
             return res.json({
                 success: false,
                 error: "Gare de départ ou d'arrivée introuvable",
                 found: {
-                    origin: originStops.map(s => s.stop_name),
-                    destination: destStops.map(s => s.stop_name)
+                    origin: stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_name),
+                    destination: stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_name)
                 }
             });
         }
 
-        const originIds = originStops.map(s => s.stop_id);
-        const destIds = destStops.map(s => s.stop_id);
-
         // 3. Rechercher les trajets directs
-        const directTrains = await findDirectTrains(originIds, destIds, serviceIds);
+        const directTrains = await findDirectTrains(depIds, arrIds, serviceIds);
 
         // 4. Rechercher les trajets avec correspondances si demandé
         let transferTrains = [];
         if (parseInt(maxTransfers) >= 1) {
             transferTrains = await findTrainsWithTransfers(
-                originIds, 
-                destIds, 
+                depIds, 
+                arrIds, 
                 serviceIds, 
                 parseInt(maxTransfers),
                 parseInt(minTransferTime)
             );
         }
 
-        // 5. Combiner et trier tous les résultats
+        // 5. Dédupliquer : garder le meilleur trajet par heure de départ
         const allJourneys = [
             ...directTrains.map(t => ({ ...t, type: 'direct', transfers: 0 })),
             ...transferTrains
-        ].sort((a, b) => {
-            // Trier par heure de départ
-            return a.departure_time.localeCompare(b.departure_time);
+        ];
+
+        // Grouper par heure de départ (arrondie à 5 min) + gare de départ
+        const journeyMap = new Map();
+        
+        allJourneys.forEach(journey => {
+            // Créer une clé basée sur l'heure de départ (arrondie) et la gare
+            const depTime = journey.departure_time;
+            const [hours, minutes] = depTime.split(':').map(Number);
+            const roundedMinutes = Math.floor(minutes / 5) * 5; // Arrondir à 5 min
+            const key = `${journey.departure_station}-${hours}:${roundedMinutes.toString().padStart(2, '0')}`;
+            
+            const existing = journeyMap.get(key);
+            
+            if (!existing) {
+                // Pas de trajet existant, on l'ajoute
+                journeyMap.set(key, journey);
+            } else {
+                // Comparer : on garde le plus rapide OU le direct
+                const existingDuration = parseDuration(existing.duration);
+                const currentDuration = parseDuration(journey.duration);
+                
+                // Priorité : 1. Direct 2. Plus rapide
+                if (journey.type === 'direct' && existing.type !== 'direct') {
+                    journeyMap.set(key, journey);
+                } else if (existing.type === 'direct' && journey.type !== 'direct') {
+                    // Garder l'existant (direct)
+                } else if (currentDuration < existingDuration) {
+                    journeyMap.set(key, journey);
+                }
+            }
         });
+
+        // Convertir en tableau et trier
+        const uniqueJourneys = Array.from(journeyMap.values())
+            .sort((a, b) => a.departure_time.localeCompare(b.departure_time));
 
         res.json({
             success: true,
-            count: allJourneys.length,
+            count: uniqueJourneys.length,
             date: date,
-            from: originStops[0].stop_name,
-            to: destStops[0].stop_name,
+            from: stops.find(s => depIds.includes(s.stop_id))?.stop_name,
+            to: stops.find(s => arrIds.includes(s.stop_id))?.stop_name,
             summary: {
-                direct: directTrains.length,
-                withTransfers: transferTrains.length
+                direct: uniqueJourneys.filter(j => j.type === 'direct').length,
+                withTransfers: uniqueJourneys.filter(j => j.type === 'with_transfer').length,
+                total: uniqueJourneys.length
             },
-            journeys: allJourneys
+            trains: uniqueJourneys
         });
 
     } catch (error) {
         console.error('Erreur recherche:', error);
         res.status(500).json({ 
             success: false, 
-            error: error.message,
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            error: error.message
         });
     }
 });
+
+/**
+ * Parse une durée "3h45" en minutes
+ */
+function parseDuration(durationStr) {
+    try {
+        const match = durationStr.match(/(\d+)h(\d+)/);
+        if (!match) return 9999;
+        return parseInt(match[1]) * 60 + parseInt(match[2]);
+    } catch (e) {
+        return 9999;
+    }
+}
 
 // ===================================
 // FONCTIONS UTILITAIRES
@@ -506,90 +539,6 @@ function calculateDuration(departTime, arrivalTime) {
     }
 }
 
-// ===================================
-// ROUTE ORIGINALE (trajets directs uniquement)
-// ===================================
-app.get('/api/trains', async (req, res) => {
-    try {
-        const { from, to, date } = req.query;
-
-        if (!from || !to || !date) {
-            return res.status(400).json({ error: "Paramètres from, to et date requis" });
-        }
-
-        // 1. Récupérer les services actifs pour la date
-        const { data: activeServices, error: sError } = await supabase
-            .from('calendar_dates')
-            .select('service_id')
-            .eq('date', date)
-            .eq('exception_type', 1);
-
-        if (sError) throw sError;
-        
-        const serviceIds = activeServices.map(s => s.service_id);
-        if (serviceIds.length === 0) {
-            return res.json({ success: true, count: 0, message: "Aucun service trouvé pour cette date" });
-        }
-
-        // 2. Trouver les IDs des gares
-        const { data: stops } = await supabase
-            .from('stops')
-            .select('stop_id, stop_name')
-            .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
-
-        const depIds = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
-        const arrIds = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
-
-        // 3. Requête principale
-        const { data: results, error: rError } = await supabase
-            .from('stop_times')
-            .select(`
-                trip_id,
-                arrival_time,
-                departure_time,
-                stop_sequence,
-                stop_id,
-                stops(stop_name),
-                trips!inner (
-                    trip_headsign,
-                    route_id,
-                    service_id,
-                    routes(route_short_name, route_long_name)
-                )
-            `)
-            .in('stop_id', [...depIds, ...arrIds])
-            .in('trips.service_id', serviceIds);
-
-        if (rError) throw rError;
-
-        // 4. Groupement par trajet
-        const tripsMap = {};
-        results.forEach(row => {
-            if (!tripsMap[row.trip_id]) tripsMap[row.trip_id] = { dep: null, arr: null };
-            if (depIds.includes(row.stop_id)) tripsMap[row.trip_id].dep = row;
-            else if (arrIds.includes(row.stop_id)) tripsMap[row.trip_id].arr = row;
-        });
-
-        const trains = Object.values(tripsMap)
-            .filter(t => t.dep && t.arr && t.dep.stop_sequence < t.arr.stop_sequence)
-            .map(t => ({
-                train_number: t.dep.trips.trip_headsign || t.dep.trips.routes.route_short_name || 'N/A',
-                type: t.dep.trips.routes.route_long_name || "Train",
-                departure_station: t.dep.stops.stop_name,
-                arrival_station: t.arr.stops.stop_name,
-                departure_time: t.dep.departure_time,
-                arrival_time: t.arr.arrival_time,
-                duration: calculateDuration(t.dep.departure_time, t.arr.arrival_time)
-            }))
-            .sort((a, b) => a.departure_time.localeCompare(b.departure_time));
-
-        res.json({ success: true, count: trains.length, date, trains });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
 // Route pour voir les dates disponibles
 app.get('/api/available-dates', async (req, res) => {
     try {
@@ -731,9 +680,9 @@ app.use((req, res) => {
             'GET /',
             'GET /health',
             'GET /api/available-dates',
-            'GET /api/trains?from=Paris&to=Nantes&date=2026-07-10',
-            'GET /api/trains/search?from=Paris&to=Marseille&date=2026-07-10&maxTransfers=1&minTransferTime=30',
-            'GET /api/stations?search=Paris'
+            'GET /api/trains?from=Paris&to=Nantes&date=2026-07-10&maxTransfers=1&minTransferTime=30',
+            'GET /api/stations?search=Paris',
+            'GET /api/debug/dates?date=2026-07-10'
         ]
     });
 });
