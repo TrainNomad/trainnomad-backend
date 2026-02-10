@@ -282,7 +282,8 @@ async function findDirectTrains(originIds, destIds, serviceIds) {
 }
 
 /**
- * Recherche les trajets avec correspondances (VERSION OPTIMISÉE)
+ * Recherche les trajets avec correspondances (APPROCHE THÉORIE DES GRAPHES)
+ * Utilise l'intersection S(A) ∩ E(B) pour trouver les gares de correspondance
  */
 async function findTrainsWithTransfers(originIds, destIds, serviceIds, maxTransfers, minTransferTime) {
     if (maxTransfers < 1) return [];
@@ -290,8 +291,13 @@ async function findTrainsWithTransfers(originIds, destIds, serviceIds, maxTransf
     const journeys = [];
 
     try {
-        // ÉTAPE 1: Récupérer uniquement les trains qui partent de l'origine
-        const { data: firstLegStops, error: e1 } = await supabase
+        // ===================================================================
+        // ÉTAPE 1 : PARALLÉLISATION - Deux requêtes simultanées
+        // ===================================================================
+        
+        // Q1: S(A) - Ensemble des gares accessibles depuis A
+        // Récupère tous les trains partant de l'origine avec TOUS leurs arrêts
+        const q1Promise = supabase
             .from('stop_times')
             .select(`
                 trip_id,
@@ -310,15 +316,11 @@ async function findTrainsWithTransfers(originIds, destIds, serviceIds, maxTransf
             .in('stop_id', originIds)
             .in('trips.service_id', serviceIds)
             .order('departure_time', { ascending: true })
-            .limit(50); // Limiter à 50 trains de départ pour éviter le timeout
+            .limit(50); // Limiter le nombre de trains de départ
 
-        if (e1) throw e1;
-        if (!firstLegStops || firstLegStops.length === 0) return [];
-
-        // ÉTAPE 2: Pour chaque train de départ, récupérer TOUS ses arrêts
-        const firstLegTripIds = [...new Set(firstLegStops.map(s => s.trip_id))];
-        
-        const { data: allFirstLegStops, error: e2 } = await supabase
+        // Q2: E(B) - Ensemble des gares qui permettent d'arriver à B
+        // Récupère tous les trains arrivant à la destination avec TOUS leurs arrêts
+        const q2Promise = supabase
             .from('stop_times')
             .select(`
                 trip_id,
@@ -326,141 +328,209 @@ async function findTrainsWithTransfers(originIds, destIds, serviceIds, maxTransf
                 departure_time,
                 stop_sequence,
                 stop_id,
-                stops(stop_id, stop_name)
+                stops(stop_id, stop_name),
+                trips!inner (
+                    trip_headsign,
+                    route_id,
+                    service_id,
+                    routes(route_short_name, route_long_name)
+                )
             `)
-            .in('trip_id', firstLegTripIds)
+            .in('stop_id', destIds)
+            .in('trips.service_id', serviceIds)
+            .order('arrival_time', { ascending: true })
+            .limit(100);
+
+        // Exécution parallèle des deux requêtes
+        const [{ data: trainsFromOrigin, error: e1 }, { data: trainsToDestination, error: e2 }] = 
+            await Promise.all([q1Promise, q2Promise]);
+
+        if (e1 || e2) {
+            console.error('Erreur lors des requêtes parallèles:', e1 || e2);
+            return [];
+        }
+
+        if (!trainsFromOrigin?.length || !trainsToDestination?.length) {
+            return [];
+        }
+
+        // ===================================================================
+        // ÉTAPE 2 : CONSTRUCTION DES ENSEMBLES S(A) et E(B)
+        // ===================================================================
+
+        // Récupérer tous les arrêts des trains partant de A
+        const train1TripIds = [...new Set(trainsFromOrigin.map(t => t.trip_id))];
+        
+        const { data: allStopsFromA, error: e3 } = await supabase
+            .from('stop_times')
+            .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
+            .in('trip_id', train1TripIds)
             .order('trip_id', { ascending: true })
             .order('stop_sequence', { ascending: true });
 
-        if (e2) throw e2;
+        if (e3) {
+            console.error('Erreur récupération arrêts depuis A:', e3);
+            return [];
+        }
+
+        // Récupérer tous les arrêts des trains allant vers B
+        const train2TripIds = [...new Set(trainsToDestination.map(t => t.trip_id))];
+        
+        const { data: allStopsToB, error: e4 } = await supabase
+            .from('stop_times')
+            .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
+            .in('trip_id', train2TripIds)
+            .order('trip_id', { ascending: true })
+            .order('stop_sequence', { ascending: true });
+
+        if (e4) {
+            console.error('Erreur récupération arrêts vers B:', e4);
+            return [];
+        }
 
         // Grouper par trip_id
-        const firstLegTrips = {};
-        allFirstLegStops.forEach(stop => {
-            if (!firstLegTrips[stop.trip_id]) {
-                firstLegTrips[stop.trip_id] = [];
-            }
-            firstLegTrips[stop.trip_id].push(stop);
+        const stopsFromAByTrip = groupByTripId(allStopsFromA);
+        const stopsToBByTrip = groupByTripId(allStopsToB);
+
+        // ===================================================================
+        // ÉTAPE 3 : CALCUL DE L'INTERSECTION S(A) ∩ E(B)
+        // ===================================================================
+
+        // Construire S(A): Map de stop_id -> [trips qui y passent depuis A]
+        const setA = new Map(); // stop_id -> [{trip_id, arrival_time, departure_time, stop_sequence, trip_info}]
+        
+        trainsFromOrigin.forEach(departureStop => {
+            const tripStops = stopsFromAByTrip[departureStop.trip_id];
+            if (!tripStops) return;
+
+            const originStop = tripStops.find(s => originIds.includes(s.stop_id));
+            if (!originStop) return;
+
+            // Pour chaque arrêt après le départ
+            tripStops.forEach(stop => {
+                if (stop.stop_sequence <= originStop.stop_sequence) return;
+                if (destIds.includes(stop.stop_id)) return; // Exclure la destination finale
+
+                if (!setA.has(stop.stop_id)) {
+                    setA.set(stop.stop_id, []);
+                }
+
+                setA.get(stop.stop_id).push({
+                    trip_id: departureStop.trip_id,
+                    arrival_time: stop.arrival_time,
+                    departure_time_from_origin: originStop.departure_time,
+                    arrival_time_at_transfer: stop.arrival_time,
+                    stop_sequence: stop.stop_sequence,
+                    origin_stop: originStop.stops.stop_name,
+                    transfer_stop: stop.stops.stop_name,
+                    trip_info: departureStop.trips
+                });
+            });
         });
 
-        // ÉTAPE 3: Pour chaque train de départ, identifier les gares de correspondance possibles
-        for (const firstLegStop of firstLegStops) {
-            const tripStops = firstLegTrips[firstLegStop.trip_id];
-            if (!tripStops) continue;
+        // Construire E(B): Map de stop_id -> [trips qui en partent vers B]
+        const setB = new Map(); // stop_id -> [{trip_id, departure_time, arrival_time, stop_sequence, trip_info}]
+        
+        trainsToDestination.forEach(arrivalStop => {
+            const tripStops = stopsToBByTrip[arrivalStop.trip_id];
+            if (!tripStops) return;
 
-            const departureStop = tripStops.find(s => originIds.includes(s.stop_id));
-            if (!departureStop) continue;
+            const destinationStop = tripStops.find(s => destIds.includes(s.stop_id));
+            if (!destinationStop) return;
 
-            // Récupérer les métadonnées du train
-            const tripInfo = firstLegStop.trips;
+            // Pour chaque arrêt avant l'arrivée
+            tripStops.forEach(stop => {
+                if (stop.stop_sequence >= destinationStop.stop_sequence) return;
+                if (originIds.includes(stop.stop_id)) return; // Exclure l'origine
 
-            // Trouver les gares potentielles de correspondance (après le départ, avant la destination)
-            const potentialTransferStops = tripStops.filter(stop => 
-                stop.stop_sequence > departureStop.stop_sequence &&
-                !destIds.includes(stop.stop_id)
-            );
+                if (!setB.has(stop.stop_id)) {
+                    setB.set(stop.stop_id, []);
+                }
 
-            // Limiter à 10 gares de correspondance max par train
-            const transferStops = potentialTransferStops.slice(0, 10);
+                setB.get(stop.stop_id).push({
+                    trip_id: arrivalStop.trip_id,
+                    departure_time: stop.departure_time,
+                    arrival_time_at_destination: destinationStop.arrival_time,
+                    stop_sequence: stop.stop_sequence,
+                    transfer_stop: stop.stops.stop_name,
+                    destination_stop: destinationStop.stops.stop_name,
+                    trip_info: arrivalStop.trips
+                });
+            });
+        });
 
-            // ÉTAPE 4: Pour chaque gare de correspondance, chercher des trains vers la destination
-            for (const transferStop of transferStops) {
-                const arrivalAtTransfer = transferStop.arrival_time;
-                const transferStopId = transferStop.stop_id;
+        // Calculer C ∈ S(A) ∩ E(B)
+        const commonStops = [...setA.keys()].filter(stopId => setB.has(stopId));
 
-                // Calculer l'heure minimum de départ du 2ème train
-                const minDepartureTime = addMinutes(arrivalAtTransfer, minTransferTime);
-                const maxDepartureTime = addMinutes(arrivalAtTransfer, 360); // Max 6h d'attente
+        console.log(`🔍 Intersection trouvée: ${commonStops.length} gares communes`);
 
-                // Chercher les trains partant de cette gare vers la destination
-                const { data: secondLegCandidates, error: e3 } = await supabase
-                    .from('stop_times')
-                    .select(`
-                        trip_id,
-                        arrival_time,
-                        departure_time,
-                        stop_sequence,
-                        stop_id,
-                        stops(stop_id, stop_name),
-                        trips!inner (
-                            trip_headsign,
-                            route_id,
-                            service_id,
-                            routes(route_short_name, route_long_name)
-                        )
-                    `)
-                    .eq('stop_id', transferStopId)
-                    .in('trips.service_id', serviceIds)
-                    .gte('departure_time', minDepartureTime)
-                    .lte('departure_time', maxDepartureTime)
-                    .neq('trip_id', firstLegStop.trip_id) // Pas le même train
-                    .limit(20);
+        // ===================================================================
+        // ÉTAPE 4 : CONTRAINTE TEMPORELLE - Vérification T_arrivée + M ≤ T_départ
+        // ===================================================================
 
-                if (e3 || !secondLegCandidates) continue;
+        for (const transferStopId of commonStops) {
+            const trainsFromA = setA.get(transferStopId);
+            const trainsToB = setB.get(transferStopId);
 
-                // Pour chaque train candidat, vérifier s'il va à la destination
-                const secondLegTripIds = [...new Set(secondLegCandidates.map(s => s.trip_id))];
-                
-                const { data: secondLegToDestination, error: e4 } = await supabase
-                    .from('stop_times')
-                    .select(`
-                        trip_id,
-                        arrival_time,
-                        departure_time,
-                        stop_sequence,
-                        stop_id,
-                        stops(stop_id, stop_name)
-                    `)
-                    .in('trip_id', secondLegTripIds)
-                    .in('stop_id', destIds);
+            // Pour chaque combinaison de trains
+            for (const train1 of trainsFromA) {
+                for (const train2 of trainsToB) {
+                    // Vérifier que ce ne sont pas le même train
+                    if (train1.trip_id === train2.trip_id) continue;
 
-                if (e4 || !secondLegToDestination) continue;
-
-                // Matcher les trains qui passent par la correspondance ET la destination
-                for (const secondLegStart of secondLegCandidates) {
-                    const destStop = secondLegToDestination.find(d => 
-                        d.trip_id === secondLegStart.trip_id &&
-                        d.stop_sequence > secondLegStart.stop_sequence
-                    );
-
-                    if (!destStop) continue;
-
+                    // CONTRAINTE TEMPORELLE CRITIQUE
+                    // T_arrivée_train1(C) + M ≤ T_départ_train2(C)
                     const transferTimeMinutes = calculateTransferTimeMinutes(
-                        arrivalAtTransfer,
-                        secondLegStart.departure_time
+                        train1.arrival_time_at_transfer,
+                        train2.departure_time
                     );
 
-                    // Ajouter le trajet avec correspondance
+                    // Vérifier les contraintes
+                    if (transferTimeMinutes < minTransferTime) continue; // Trop court
+                    if (transferTimeMinutes > 360) continue; // Trop long (>6h)
+
+                    // ✅ Correspondance valide trouvée !
                     journeys.push({
                         type: 'with_transfer',
                         transfers: 1,
-                        departure_station: departureStop.stops.stop_name,
-                        arrival_station: destStop.stops.stop_name,
-                        departure_time: departureStop.departure_time,
-                        arrival_time: destStop.arrival_time,
-                        duration: calculateDuration(departureStop.departure_time, destStop.arrival_time),
+                        departure_station: train1.origin_stop,
+                        arrival_station: train2.destination_stop,
+                        departure_time: train1.departure_time_from_origin,
+                        arrival_time: train2.arrival_time_at_destination,
+                        duration: calculateDuration(
+                            train1.departure_time_from_origin,
+                            train2.arrival_time_at_destination
+                        ),
                         legs: [
                             {
-                                train_number: tripInfo.trip_headsign || tripInfo.routes.route_short_name || 'N/A',
-                                train_type: tripInfo.routes.route_long_name || "Train",
-                                departure_station: departureStop.stops.stop_name,
-                                arrival_station: transferStop.stops.stop_name,
-                                departure_time: departureStop.departure_time,
-                                arrival_time: arrivalAtTransfer,
-                                duration: calculateDuration(departureStop.departure_time, arrivalAtTransfer)
+                                train_number: train1.trip_info.trip_headsign || 
+                                            train1.trip_info.routes.route_short_name || 'N/A',
+                                train_type: train1.trip_info.routes.route_long_name || "Train",
+                                departure_station: train1.origin_stop,
+                                arrival_station: train1.transfer_stop,
+                                departure_time: train1.departure_time_from_origin,
+                                arrival_time: train1.arrival_time_at_transfer,
+                                duration: calculateDuration(
+                                    train1.departure_time_from_origin,
+                                    train1.arrival_time_at_transfer
+                                )
                             },
                             {
                                 transfer_time: `${transferTimeMinutes} min`,
-                                station: transferStop.stops.stop_name
+                                station: train1.transfer_stop
                             },
                             {
-                                train_number: secondLegStart.trips.trip_headsign || secondLegStart.trips.routes.route_short_name || 'N/A',
-                                train_type: secondLegStart.trips.routes.route_long_name || "Train",
-                                departure_station: transferStop.stops.stop_name,
-                                arrival_station: destStop.stops.stop_name,
-                                departure_time: secondLegStart.departure_time,
-                                arrival_time: destStop.arrival_time,
-                                duration: calculateDuration(secondLegStart.departure_time, destStop.arrival_time)
+                                train_number: train2.trip_info.trip_headsign || 
+                                            train2.trip_info.routes.route_short_name || 'N/A',
+                                train_type: train2.trip_info.routes.route_long_name || "Train",
+                                departure_station: train2.transfer_stop,
+                                arrival_station: train2.destination_stop,
+                                departure_time: train2.departure_time,
+                                arrival_time: train2.arrival_time_at_destination,
+                                duration: calculateDuration(
+                                    train2.departure_time,
+                                    train2.arrival_time_at_destination
+                                )
                             }
                         ]
                     });
@@ -468,34 +538,27 @@ async function findTrainsWithTransfers(originIds, destIds, serviceIds, maxTransf
             }
         }
 
+        console.log(`✅ ${journeys.length} correspondances valides trouvées`);
         return journeys;
 
     } catch (error) {
         console.error('Erreur dans findTrainsWithTransfers:', error);
-        return []; // Retourner un tableau vide en cas d'erreur plutôt que de crasher
+        return [];
     }
 }
 
 /**
- * Ajoute des minutes à un horaire format HH:MM:SS
+ * Grouper les arrêts par trip_id
  */
-function addMinutes(timeString, minutes) {
-    try {
-        const [h, m, s] = timeString.split(':').map(Number);
-        let totalMinutes = h * 60 + m + minutes;
-        
-        // Gérer le passage de minuit
-        if (totalMinutes >= 24 * 60) {
-            totalMinutes = totalMinutes % (24 * 60);
+function groupByTripId(stops) {
+    const grouped = {};
+    stops.forEach(stop => {
+        if (!grouped[stop.trip_id]) {
+            grouped[stop.trip_id] = [];
         }
-        
-        const newHours = Math.floor(totalMinutes / 60);
-        const newMinutes = totalMinutes % 60;
-        
-        return `${newHours.toString().padStart(2, '0')}:${newMinutes.toString().padStart(2, '0')}:00`;
-    } catch (e) {
-        return timeString;
-    }
+        grouped[stop.trip_id].push(stop);
+    });
+    return grouped;
 }
 
 /**
