@@ -17,7 +17,7 @@ const supabase = createClient(
 
 // ==================== CONSTANTES MATHÉMATIQUES ====================
 const TRANSFER_CONSTRAINTS = {
-    t_min: 20,      // Temps minimum de correspondance (minutes)
+    t_min: 5,      // Temps minimum de correspondance (minutes)
     t_max: 360      // Temps maximum d'attente (6 heures)
 };
 
@@ -124,7 +124,7 @@ app.get('/api/trains', async (req, res) => {
             to, 
             date, 
             startTime = "00:00:00",
-            limit = 10,
+            limit = 50,
             maxTransfers = 1,
             minTransferTime = TRANSFER_CONSTRAINTS.t_min,
             maxWaitTime = TRANSFER_CONSTRAINTS.t_max,
