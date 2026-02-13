@@ -245,15 +245,16 @@ app.get('/api/trains', async (req, res) => {
  * Recherche des trajets directs (pas de correspondance)
  */
 async function findDirectTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTime) {
+    // 1. On récupère les départs avec le nom de la gare de départ et le type de train
     const { data, error } = await supabase
         .from('stop_times')
         .select(`
             trip_id,
             departure_time,
             stop_id,
+            stops!inner ( stop_name ),
             trips!inner (
                 trip_headsign,
-                route_id,
                 train_type, 
                 service_id
             )
@@ -264,16 +265,20 @@ async function findDirectTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTim
 
     if (error) throw error;
 
-    // Ensuite, dans la boucle qui cherche l'arrivée (G_B)
     const validTrains = [];
     for (const dep of data) {
+        // 2. Pour chaque départ, on cherche l'arrivée en récupérant aussi le nom de la gare
         const { data: arrivalData } = await supabase
             .from('stop_times')
-            .select('arrival_time, stop_id')
+            .select(`
+                arrival_time, 
+                stop_id,
+                stops!inner ( stop_name )
+            `)
             .eq('trip_id', dep.trip_id)
             .in('stop_id', G_B_ids)
             .gt('arrival_time', dep.departure_time)
-            .single();
+            .maybeSingle(); // maybeSingle évite les erreurs si rien n'est trouvé
 
         if (arrivalData) {
             validTrains.push({
@@ -283,6 +288,8 @@ async function findDirectTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTim
                 train_type: dep.trips.train_type,
                 departure_time: dep.departure_time,
                 arrival_time: arrivalData.arrival_time,
+                departure_station: dep.stops.stop_name, // Nom propre (ex: Angers Saint-Laud)
+                arrival_station: arrivalData.stops.stop_name, // Nom propre
                 departure_stop_id: dep.stop_id,
                 arrival_stop_id: arrivalData.stop_id
             });
