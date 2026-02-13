@@ -140,11 +140,12 @@ app.get('/api/trains', async (req, res) => {
             .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
 
         const G_A_ids = stops
-            .filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase()))
-            .map(s => s.stop_id);
-        const G_B_ids = stops
-            .filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase()))
-            .map(s => s.stop_id);
+    .filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase()))
+    .map(s => String(s.stop_id)); // On force en String
+
+const G_B_ids = stops
+    .filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase()))
+    .map(s => String(s.stop_id)); // On force en String
 
         if (G_A_ids.length === 0 || G_B_ids.length === 0) {
             return res.json({ success: false, error: "Gare de départ ou d'arrivée introuvable" });
