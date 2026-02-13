@@ -239,241 +239,33 @@ app.get('/api/trains', async (req, res) => {
     }
 });
 
-// ==================== ALGORITHMES DE RECHERCHE ====================
+// 3. Appel de la formule mathématique dans Supabase
+const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
+    p_from_ids: G_A_ids,
+    p_to_ids: G_B_ids,
+    p_date: date,
+    p_start_time: startTime,
+    p_t_min: parseInt(minTransferTime),
+    p_t_max: parseInt(maxWaitTime)
+});
 
-/**
- * Recherche des trajets directs (pas de correspondance)
- */
-async function findDirectTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTime) {
-    const { data, error } = await supabase
-        .from('stop_times')
-        .select(`
-            trip_id,
-            departure_time,
-            stop_id,
-            stops!inner ( stop_name ),
-            trips!inner (
-                trip_headsign,
-                route_id,
-                train_type, 
-                service_id
-            )
-        `)
-        .in('stop_id', G_A_ids)
-        .in('trips.service_id', serviceIds)
-        .gte('departure_time', startTime);
+if (rpcError) throw rpcError;
 
-    if (error) throw error;
-
-    const validTrains = [];
-    for (const dep of data) {
-        const { data: arrivalData } = await supabase
-            .from('stop_times')
-            .select(`
-                arrival_time, 
-                stop_id,
-                stops!inner ( stop_name )
-            `)
-            .eq('trip_id', dep.trip_id)
-            .in('stop_id', G_B_ids)
-            .gt('arrival_time', dep.departure_time)
-            .maybeSingle();
-
-        if (arrivalData) {
-            validTrains.push({
-                type: 'direct',
-                // trip_id: dep.trip_id,
-                train_number: dep.trips.trip_headsign,
-                train_type: dep.trips.train_type,
-                departure_time: dep.departure_time,
-                arrival_time: arrivalData.arrival_time,
-                duration: calculateDuration(dep.departure_time, arrivalData.arrival_time), // <--- CONSERVÉ
-                departure_station: dep.stops.stop_name, 
-                arrival_station: arrivalData.stops.stop_name, 
-                // departure_stop_id: dep.stop_id,
-                // arrival_stop_id: arrivalData.stop_id
-            });
-        }
+// 4. Formatage simple pour le front-end
+const formattedTrains = results.map(t => ({
+    type: t.journey_type,
+    departure_station: t.departure_station,
+    arrival_station: t.arrival_station,
+    departure_time: t.departure_time,
+    arrival_time: t.arrival_time,
+    duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
+    details: {
+        stops: t.stops_list,
+        trains: t.trips_list
     }
-    return validTrains;
-}
-/**
- * Recherche des trajets avec correspondances
- * APPLICATION DES FORMULES MATHÉMATIQUES:
- * 
- * A. CONDITION DE LIEU (Intersection):
- *    Gare d'arrivée du Train 1 = Gare de départ du Train 2 = G_C
- * 
- * B. CONDITION DE TEMPS (Battement):
- *    T_arr1 + t_min ≤ T_dep2
- * 
- * C. CONDITION D'OPTIMISATION:
- *    T_dep2 - T_arr1 ≤ t_max
- */
-async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTime, t_min, t_max) {
-    console.log(`🔄 Recherche correspondances avec t_min=${t_min}min, t_max=${t_max}min`);
+}));
 
-    // ÉTAPE 1: Récupérer les trains partant de G_A
-    const { data: train1Departures, error: e1 } = await supabase
-        .from('stop_times')
-        .select(`
-            trip_id,
-            departure_time,
-            stop_sequence,
-            stop_id,
-            stops(stop_id, stop_name),
-            trips!inner (
-                trip_headsign,
-                route_id,
-                service_id,
-                train_type,
-                routes(route_short_name, route_long_name)
-            )
-        `)
-        .in('stop_id', G_A_ids)
-        .in('trips.service_id', serviceIds)
-        .gte('departure_time', startTime)
-        .order('departure_time', { ascending: true })
-        .limit(100);
-
-    if (e1 || !train1Departures?.length) return [];
-
-    // ÉTAPE 2: Récupérer les trains arrivant à G_B
-    const { data: train2Arrivals, error: e2 } = await supabase
-        .from('stop_times')
-        .select(`
-            trip_id,
-            arrival_time,
-            stop_sequence,
-            stop_id,
-            stops(stop_id, stop_name),
-            trips!inner (
-                trip_headsign,
-                route_id,
-                service_id,
-                routes(route_short_name, route_long_name)
-            )
-        `)
-        .in('stop_id', G_B_ids)
-        .in('trips.service_id', serviceIds)
-        .order('arrival_time', { ascending: true })
-        .limit(100);
-
-    if (e2 || !train2Arrivals?.length) return [];
-
-    // ÉTAPE 3: Récupérer tous les arrêts de ces trains
-    const trip1Ids = [...new Set(train1Departures.map(t => t.trip_id))];
-    const trip2Ids = [...new Set(train2Arrivals.map(t => t.trip_id))];
-
-    const { data: allStops1 } = await supabase
-        .from('stop_times')
-        .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
-        .in('trip_id', trip1Ids)
-        .order('trip_id', { ascending: true })
-        .order('stop_sequence', { ascending: true });
-
-    const { data: allStops2 } = await supabase
-        .from('stop_times')
-        .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
-        .in('trip_id', trip2Ids)
-        .order('trip_id', { ascending: true })
-        .order('stop_sequence', { ascending: true });
-
-    // ÉTAPE 4: Organiser les données par trip_id
-    const stops1ByTrip = groupByTripId(allStops1);
-    const stops2ByTrip = groupByTripId(allStops2);
-
-    // ÉTAPE 5: APPLICATION DE LA THÉORIE DES GRAPHES
-    const journeys = [];
-
-    for (const train1Dep of train1Departures) {
-        const allStopsOfTrain1 = stops1ByTrip[train1Dep.trip_id];
-        if (!allStopsOfTrain1) continue;
-
-        // Trouver le point de départ exact dans le Train 1
-        const G_A_stop = allStopsOfTrain1.find(s => G_A_ids.includes(s.stop_id));
-        if (!G_A_stop) continue;
-
-        const T_dep = G_A_stop.departure_time;
-
-        // Parcourir tous les arrêts APRÈS G_A dans le Train 1
-        const potentialTransfers = allStopsOfTrain1.filter(s => 
-            s.stop_sequence > G_A_stop.stop_sequence &&
-            !G_B_ids.includes(s.stop_id) // Exclure la destination
-        );
-
-        for (const G_C_stop_train1 of potentialTransfers) {
-            const G_C = G_C_stop_train1.stop_id;  // Gare de correspondance
-            const T_arr1 = G_C_stop_train1.arrival_time;  // Arrivée du Train 1 à G_C
-
-            // Chercher les trains qui partent de G_C et arrivent à G_B
-            for (const train2Arr of train2Arrivals) {
-                if (train2Arr.trip_id === train1Dep.trip_id) continue; // Pas le même train
-
-                const allStopsOfTrain2 = stops2ByTrip[train2Arr.trip_id];
-                if (!allStopsOfTrain2) continue;
-
-                // CONDITION A: Vérifier que le Train 2 passe par G_C
-                const G_C_stop_train2 = allStopsOfTrain2.find(s => s.stop_id === G_C);
-                if (!G_C_stop_train2) continue;
-
-                const G_B_stop = allStopsOfTrain2.find(s => G_B_ids.includes(s.stop_id));
-                if (!G_B_stop) continue;
-
-                // Vérifier que G_C est AVANT G_B dans le Train 2
-                if (G_C_stop_train2.stop_sequence >= G_B_stop.stop_sequence) continue;
-
-                const T_dep2 = G_C_stop_train2.departure_time;  // Départ du Train 2 de G_C
-                const T_arrB = G_B_stop.arrival_time;  // Arrivée finale à G_B
-
-                // CONDITION B: Vérifier T_arr1 + t_min ≤ T_dep2
-                const waitTime = isValidTransferTime(T_arr1, T_dep2, t_min);
-                if (waitTime < t_min) continue;
-
-                // CONDITION C: Vérifier T_dep2 - T_arr1 ≤ t_max
-                if (!isWithinMaxWaitTime(waitTime, t_max)) continue;
-
-                // ✅ TOUTES LES CONDITIONS SONT RESPECTÉES
-                journeys.push({
-                    type: 'with_transfer',
-                    transfers: 1,
-                    departure_station: G_A_stop.stops.stop_name,
-                    arrival_station: G_B_stop.stops.stop_name,
-                    departure_time: T_dep,
-                    arrival_time: T_arrB,
-                    duration: calculateDuration(T_dep, T_arrB),
-                    legs: [
-                        {
-                            train_number: train1Dep.trips.trip_headsign || train1Dep.trips.routes.route_short_name || 'N/A',
-                            train_type: train1Dep.trips.train_type || "Train",
-                            departure_station: G_A_stop.stops.stop_name,
-                            arrival_station: G_C_stop_train1.stops.stop_name,
-                            departure_time: T_dep,
-                            arrival_time: T_arr1,
-                            duration: calculateDuration(T_dep, T_arr1)
-                        },
-                        {
-                            transfer_time: `${waitTime} min`,
-                            station: G_C_stop_train1.stops.stop_name
-                        },
-                        {
-                            train_number: train2Arr.trips.trip_headsign || train2Arr.trips.routes.route_short_name || 'N/A',
-                            train_type: train2Arr.trips.train_type || "Train",
-                            departure_station: G_C_stop_train2.stops.stop_name,
-                            arrival_station: G_B_stop.stops.stop_name,
-                            departure_time: T_dep2,
-                            arrival_time: T_arrB,
-                            duration: calculateDuration(T_dep2, T_arrB)
-                        }
-                    ]
-                });
-            }
-        }
-    }
-
-    console.log(`✅ ${journeys.length} correspondances valides trouvées`);
-    return journeys;
-}
+res.json({ success: true, count: formattedTrains.length, trains: formattedTrains });
 
 // ==================== FONCTIONS AUXILIAIRES ====================
 
