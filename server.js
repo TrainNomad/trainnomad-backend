@@ -334,7 +334,7 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
         .in('trips.service_id', serviceIds)
         .gte('departure_time', startTime)
         .order('departure_time', { ascending: true })
-        .limit(50);
+        .limit(100);
 
     if (e1 || !train1Departures?.length) return [];
 
@@ -458,7 +458,7 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                         },
                         {
                             train_number: train2Arr.trips.trip_headsign || train2Arr.trips.routes.route_short_name || 'N/A',
-                            train_type: train2Arr.trips.routes.route_long_name || "Train",
+                            train_type: train2Arr.trips.train_type || "Train",
                             departure_station: G_C_stop_train2.stops.stop_name,
                             arrival_station: G_B_stop.stops.stop_name,
                             departure_time: T_dep2,
@@ -606,7 +606,7 @@ app.use((req, res) => {
             'GET /',
             'GET /health',
             'GET /api/available-dates',
-            'GET /api/trains?from=Paris&to=Marseille&date=2026-07-10&startTime=08:00&limit=10',
+            'GET /api/trains?from=Paris&to=Marseille&date=2026-07-10&startTime=08:00&limit=50',
             'GET /api/stations?search=Paris'
         ]
     });
