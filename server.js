@@ -5,11 +5,9 @@ const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Initialisation Supabase
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
@@ -125,117 +123,78 @@ app.get('/api/trains', async (req, res) => {
             date, 
             startTime = "00:00:00",
             limit = 50,
-            maxTransfers = 1,
-            minTransferTime = TRANSFER_CONSTRAINTS.t_min,
-            maxWaitTime = TRANSFER_CONSTRAINTS.t_max,
-            includeTransfers = 'true'
+            minTransferTime = 5,
+            maxWaitTime = 360
         } = req.query;
 
         if (!from || !to || !date) {
-            return res.status(400).json({ 
-                error: "Paramètres from, to et date requis"
-            });
+            return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        console.log(`🔍 Recherche: ${from} → ${to} @ ${date} à partir de ${startTime}`);
+        console.log(`🔍 Calcul mathématique : ${from} → ${to} le ${date}`);
 
-        // 1. Récupérer les services actifs
-        const { data: activeServices, error: sError } = await supabase
-            .from('calendar_dates')
-            .select('service_id')
-            .eq('date', date)
-            .eq('exception_type', 1);
-
-        if (sError) throw sError;
-        
-        const serviceIds = activeServices.map(s => s.service_id);
-        if (serviceIds.length === 0) {
-            return res.json({ 
-                success: true, 
-                count: 0, 
-                message: "Aucun service trouvé pour cette date" 
-            });
-        }
-
-        // 2. Trouver les gares G_A et G_B
+        // 1. Identification des IDs des gares (Indispensable pour la fonction SQL)
         const { data: stops } = await supabase
             .from('stops')
             .select('stop_id, stop_name')
             .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
 
-        const G_A_ids = stops.filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase())).map(s => s.stop_id);
-        const G_B_ids = stops.filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase())).map(s => s.stop_id);
+        const G_A_ids = stops
+            .filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase()))
+            .map(s => s.stop_id);
+        const G_B_ids = stops
+            .filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase()))
+            .map(s => s.stop_id);
 
         if (G_A_ids.length === 0 || G_B_ids.length === 0) {
-            return res.json({
-                success: false,
-                error: "Gare introuvable"
-            });
+            return res.json({ success: false, error: "Gare de départ ou d'arrivée introuvable" });
         }
 
-        // 3. Rechercher les trajets directs
-        const directTrains = await findDirectTrains(
-            supabase,
-            G_A_ids,
-            G_B_ids,
-            serviceIds,
-            startTime
-        );
+        // 2. APPEL DE LA FORMULE (RPC)
+        // On envoie les données brutes à PostgreSQL qui traite les millions de lignes
+        const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
+            p_from_ids: G_A_ids,
+            p_to_ids: G_B_ids,
+            p_date: date,
+            p_start_time: startTime,
+            p_t_min: parseInt(minTransferTime),
+            p_t_max: parseInt(maxWaitTime)
+        });
 
-        // 4. Rechercher les correspondances si demandé
-        let transferTrains = [];
-        if (includeTransfers === 'true' && parseInt(maxTransfers) >= 1) {
-            transferTrains = await findTransferTrains(
-                supabase,
-                G_A_ids,
-                G_B_ids,
-                serviceIds,
-                startTime,
-                parseInt(minTransferTime),
-                parseInt(maxWaitTime)
-            );
-        }
+        if (rpcError) throw rpcError;
 
-        // 5. Combiner et dédupliquer
-        const allTrains = [...directTrains, ...transferTrains];
-        const uniqueTrains = deduplicateTrains(allTrains);
+        // 3. Formatage pour le front-end
+        const formattedTrains = results.map(t => ({
+            type: t.journey_type,
+            departure_station: t.departure_station,
+            arrival_station: t.arrival_station,
+            departure_time: t.departure_time,
+            arrival_time: t.arrival_time,
+            // Conversion mathématique de la durée stockée en minutes
+            duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
+            details: {
+                steps: t.stops_list, // Liste des gares de passage
+                train_names: t.trips_list // Noms des trains empruntés
+            }
+        }));
 
-        // 6. Trier et limiter
-        const sortedTrains = uniqueTrains
-            .sort((a, b) => a.departure_time.localeCompare(b.departure_time))
-            .slice(0, parseInt(limit));
+        // 4. Déduplication finale (Optionnel mais recommandé)
+        const finalResults = deduplicateTrains(formattedTrains).slice(0, parseInt(limit));
 
-        // 7. Pagination
-        const hasMore = uniqueTrains.length > parseInt(limit);
-        const nextStartTime = hasMore ? sortedTrains[sortedTrains.length - 1].departure_time : null;
-
-        console.log(`✅ ${sortedTrains.length} trajets trouvés (${directTrains.length} directs, ${transferTrains.length} correspondances)`);
+        console.log(`✅ ${finalResults.length} trajets calculés avec succès.`);
 
         res.json({
             success: true,
-            count: sortedTrains.length,
+            count: finalResults.length,
+            from: from,
+            to: to,
             date: date,
-            from: stops.find(s => G_A_ids.includes(s.stop_id))?.stop_name,
-            to: stops.find(s => G_B_ids.includes(s.stop_id))?.stop_name,
-            pagination: {
-                startTime: startTime,
-                nextStartTime: nextStartTime,
-                hasMore: hasMore,
-                limit: parseInt(limit)
-            },
-            summary: {
-                direct: sortedTrains.filter(t => t.type === 'direct').length,
-                withTransfers: sortedTrains.filter(t => t.type === 'with_transfer').length
-            },
-            trains: sortedTrains
+            trains: finalResults
         });
 
     } catch (error) {
-        console.error('❌ Erreur:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message
-        });
+        console.error('❌ Erreur Route Trains:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
