@@ -326,6 +326,7 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                 trip_headsign,
                 route_id,
                 service_id,
+                train_type,
                 routes(route_short_name, route_long_name)
             )
         `)
