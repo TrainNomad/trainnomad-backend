@@ -198,33 +198,33 @@ app.get('/api/trains', async (req, res) => {
     }
 });
 
-// 3. Appel de la formule mathématique dans Supabase
-const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
-    p_from_ids: G_A_ids,
-    p_to_ids: G_B_ids,
-    p_date: date,
-    p_start_time: startTime,
-    p_t_min: parseInt(minTransferTime),
-    p_t_max: parseInt(maxWaitTime)
-});
+// // 3. Appel de la formule mathématique dans Supabase
+// const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
+//     p_from_ids: G_A_ids,
+//     p_to_ids: G_B_ids,
+//     p_date: date,
+//     p_start_time: startTime,
+//     p_t_min: parseInt(minTransferTime),
+//     p_t_max: parseInt(maxWaitTime)
+// });
 
-if (rpcError) throw rpcError;
+// if (rpcError) throw rpcError;
 
-// 4. Formatage simple pour le front-end
-const formattedTrains = results.map(t => ({
-    type: t.journey_type,
-    departure_station: t.departure_station,
-    arrival_station: t.arrival_station,
-    departure_time: t.departure_time,
-    arrival_time: t.arrival_time,
-    duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
-    details: {
-        stops: t.stops_list,
-        trains: t.trips_list
-    }
-}));
+// // 4. Formatage simple pour le front-end
+// const formattedTrains = results.map(t => ({
+//     type: t.journey_type,
+//     departure_station: t.departure_station,
+//     arrival_station: t.arrival_station,
+//     departure_time: t.departure_time,
+//     arrival_time: t.arrival_time,
+//     duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
+//     details: {
+//         stops: t.stops_list,
+//         trains: t.trips_list
+//     }
+// }));
 
-res.json({ success: true, count: formattedTrains.length, trains: formattedTrains });
+// res.json({ success: true, count: formattedTrains.length, trains: formattedTrains });
 
 // ==================== FONCTIONS AUXILIAIRES ====================
 
