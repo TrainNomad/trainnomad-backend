@@ -326,6 +326,7 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                 trip_headsign,
                 route_id,
                 service_id,
+                train_type, -- RÉCUPÉRATION DU TYPE DE TRAIN 1
                 routes(route_short_name, route_long_name)
             )
         `)
@@ -350,6 +351,7 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                 trip_headsign,
                 route_id,
                 service_id,
+                train_type, -- RÉCUPÉRATION DU TYPE DE TRAIN 2
                 routes(route_short_name, route_long_name)
             )
         `)
@@ -360,79 +362,60 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
 
     if (e2 || !train2Arrivals?.length) return [];
 
-    // ÉTAPE 3: Récupérer tous les arrêts de ces trains
+    // ÉTAPE 3: Récupérer tous les arrêts (Identique)
     const trip1Ids = [...new Set(train1Departures.map(t => t.trip_id))];
     const trip2Ids = [...new Set(train2Arrivals.map(t => t.trip_id))];
 
     const { data: allStops1 } = await supabase
         .from('stop_times')
         .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
-        .in('trip_id', trip1Ids)
-        .order('trip_id', { ascending: true })
-        .order('stop_sequence', { ascending: true });
+        .in('trip_id', trip1Ids);
 
     const { data: allStops2 } = await supabase
         .from('stop_times')
         .select('trip_id, stop_id, stop_sequence, arrival_time, departure_time, stops(stop_id, stop_name)')
-        .in('trip_id', trip2Ids)
-        .order('trip_id', { ascending: true })
-        .order('stop_sequence', { ascending: true });
+        .in('trip_id', trip2Ids);
 
-    // ÉTAPE 4: Organiser les données par trip_id
     const stops1ByTrip = groupByTripId(allStops1);
     const stops2ByTrip = groupByTripId(allStops2);
 
-    // ÉTAPE 5: APPLICATION DE LA THÉORIE DES GRAPHES
     const journeys = [];
 
     for (const train1Dep of train1Departures) {
         const allStopsOfTrain1 = stops1ByTrip[train1Dep.trip_id];
         if (!allStopsOfTrain1) continue;
 
-        // Trouver le point de départ exact dans le Train 1
         const G_A_stop = allStopsOfTrain1.find(s => G_A_ids.includes(s.stop_id));
         if (!G_A_stop) continue;
 
         const T_dep = G_A_stop.departure_time;
-
-        // Parcourir tous les arrêts APRÈS G_A dans le Train 1
-        const potentialTransfers = allStopsOfTrain1.filter(s => 
-            s.stop_sequence > G_A_stop.stop_sequence &&
-            !G_B_ids.includes(s.stop_id) // Exclure la destination
-        );
+        const potentialTransfers = allStopsOfTrain1.filter(s => s.stop_sequence > G_A_stop.stop_sequence && !G_B_ids.includes(s.stop_id));
 
         for (const G_C_stop_train1 of potentialTransfers) {
-            const G_C = G_C_stop_train1.stop_id;  // Gare de correspondance
-            const T_arr1 = G_C_stop_train1.arrival_time;  // Arrivée du Train 1 à G_C
+            const G_C = G_C_stop_train1.stop_id;
+            const T_arr1 = G_C_stop_train1.arrival_time;
 
-            // Chercher les trains qui partent de G_C et arrivent à G_B
             for (const train2Arr of train2Arrivals) {
-                if (train2Arr.trip_id === train1Dep.trip_id) continue; // Pas le même train
+                if (train2Arr.trip_id === train1Dep.trip_id) continue;
 
                 const allStopsOfTrain2 = stops2ByTrip[train2Arr.trip_id];
                 if (!allStopsOfTrain2) continue;
 
-                // CONDITION A: Vérifier que le Train 2 passe par G_C
                 const G_C_stop_train2 = allStopsOfTrain2.find(s => s.stop_id === G_C);
                 if (!G_C_stop_train2) continue;
 
                 const G_B_stop = allStopsOfTrain2.find(s => G_B_ids.includes(s.stop_id));
                 if (!G_B_stop) continue;
 
-                // Vérifier que G_C est AVANT G_B dans le Train 2
                 if (G_C_stop_train2.stop_sequence >= G_B_stop.stop_sequence) continue;
 
-                const T_dep2 = G_C_stop_train2.departure_time;  // Départ du Train 2 de G_C
-                const T_arrB = G_B_stop.arrival_time;  // Arrivée finale à G_B
+                const T_dep2 = G_C_stop_train2.departure_time;
+                const T_arrB = G_B_stop.arrival_time;
 
-                // CONDITION B: Vérifier T_arr1 + t_min ≤ T_dep2
                 const waitTime = isValidTransferTime(T_arr1, T_dep2, t_min);
-                if (waitTime < t_min) continue;
+                if (waitTime < t_min || !isWithinMaxWaitTime(waitTime, t_max)) continue;
 
-                // CONDITION C: Vérifier T_dep2 - T_arr1 ≤ t_max
-                if (!isWithinMaxWaitTime(waitTime, t_max)) continue;
-
-                // ✅ TOUTES LES CONDITIONS SONT RESPECTÉES
+                // ✅ AJOUT DES CHAMPS train_type DANS LES LEGS
                 journeys.push({
                     type: 'with_transfer',
                     transfers: 1,
@@ -443,8 +426,8 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                     duration: calculateDuration(T_dep, T_arrB),
                     legs: [
                         {
-                            train_number: train1Dep.trips.trip_headsign || train1Dep.trips.routes.route_short_name || 'N/A',
-                            train_type: train1Dep.trips.routes.route_long_name || "Train",
+                            train_number: train1Dep.trips.trip_headsign || 'N/A',
+                            train_type: train1Dep.trips.train_type, // <--- TYPE RÉCUPÉRÉ EN BDD
                             departure_station: G_A_stop.stops.stop_name,
                             arrival_station: G_C_stop_train1.stops.stop_name,
                             departure_time: T_dep,
@@ -456,8 +439,8 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
                             station: G_C_stop_train1.stops.stop_name
                         },
                         {
-                            train_number: train2Arr.trips.trip_headsign || train2Arr.trips.routes.route_short_name || 'N/A',
-                            train_type: train2Arr.trips.routes.route_long_name || "Train",
+                            train_number: train2Arr.trips.trip_headsign || 'N/A',
+                            train_type: train2Arr.trips.train_type, // <--- TYPE RÉCUPÉRÉ EN BDD
                             departure_station: G_C_stop_train2.stops.stop_name,
                             arrival_station: G_B_stop.stops.stop_name,
                             departure_time: T_dep2,
@@ -470,7 +453,6 @@ async function findTransferTrains(supabase, G_A_ids, G_B_ids, serviceIds, startT
         }
     }
 
-    console.log(`✅ ${journeys.length} correspondances valides trouvées`);
     return journeys;
 }
 
