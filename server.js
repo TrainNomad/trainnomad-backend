@@ -245,63 +245,51 @@ app.get('/api/trains', async (req, res) => {
  * Recherche des trajets directs (pas de correspondance)
  */
 async function findDirectTrains(supabase, G_A_ids, G_B_ids, serviceIds, startTime) {
-    const { data: results, error } = await supabase
+    const { data, error } = await supabase
         .from('stop_times')
         .select(`
             trip_id,
-            arrival_time,
             departure_time,
-            stop_sequence,
             stop_id,
-            stops(stop_name),
             trips!inner (
                 trip_headsign,
                 route_id,
-                service_id,
-                routes(route_short_name, route_long_name)
+                train_type, 
+                service_id
             )
         `)
-        .in('stop_id', [...G_A_ids, ...G_B_ids])
+        .in('stop_id', G_A_ids)
         .in('trips.service_id', serviceIds)
-        .gte('departure_time', startTime)
-        .order('departure_time', { ascending: true })
-        .limit(300);
+        .gte('departure_time', startTime);
 
     if (error) throw error;
 
-    // Groupement par trip_id
-    const tripsMap = {};
-    results.forEach(row => {
-        if (!tripsMap[row.trip_id]) {
-            tripsMap[row.trip_id] = { dep: null, arr: null };
-        }
-        
-        if (G_A_ids.includes(row.stop_id)) {
-            if (!tripsMap[row.trip_id].dep || row.stop_sequence < tripsMap[row.trip_id].dep.stop_sequence) {
-                tripsMap[row.trip_id].dep = row;
-            }
-        } else if (G_B_ids.includes(row.stop_id)) {
-            if (!tripsMap[row.trip_id].arr || row.stop_sequence > tripsMap[row.trip_id].arr.stop_sequence) {
-                tripsMap[row.trip_id].arr = row;
-            }
-        }
-    });
+    // Ensuite, dans la boucle qui cherche l'arrivée (G_B)
+    const validTrains = [];
+    for (const dep of data) {
+        const { data: arrivalData } = await supabase
+            .from('stop_times')
+            .select('arrival_time, stop_id')
+            .eq('trip_id', dep.trip_id)
+            .in('stop_id', G_B_ids)
+            .gt('arrival_time', dep.departure_time)
+            .single();
 
-    return Object.values(tripsMap)
-        .filter(t => t.dep && t.arr && t.dep.stop_sequence < t.arr.stop_sequence)
-        .map(t => ({
-            type: 'direct',
-            transfers: 0,
-            train_number: t.dep.trips.trip_headsign || t.dep.trips.routes.route_short_name || 'N/A',
-            train_type: t.dep.trips.routes.route_long_name || "Train",
-            departure_station: t.dep.stops.stop_name,
-            arrival_station: t.arr.stops.stop_name,
-            departure_time: t.dep.departure_time,
-            arrival_time: t.arr.arrival_time,
-            duration: calculateDuration(t.dep.departure_time, t.arr.arrival_time)
-        }));
+        if (arrivalData) {
+            validTrains.push({
+                type: 'direct',
+                trip_id: dep.trip_id,
+                train_number: dep.trips.trip_headsign,
+                train_type: dep.trips.train_type,
+                departure_time: dep.departure_time,
+                arrival_time: arrivalData.arrival_time,
+                departure_stop_id: dep.stop_id,
+                arrival_stop_id: arrivalData.stop_id
+            });
+        }
+    }
+    return validTrains;
 }
-
 /**
  * Recherche des trajets avec correspondances
  * APPLICATION DES FORMULES MATHÉMATIQUES:

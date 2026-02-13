@@ -45,15 +45,32 @@ const GTFS_TABLES = {
     trips: {
         file: 'trips.txt',
         uniqueKey: 'trip_id',
-        transform: (row) => ({
-            route_id: row.route_id || null,
-            service_id: row.service_id || null,
-            trip_id: row.trip_id || null,
-            trip_headsign: row.trip_headsign || null,
-            direction_id: row.direction_id ? parseInt(row.direction_id) : null,
-            block_id: row.block_id || null,
-            shape_id: row.shape_id || null
-        })
+        transform: (row) => {
+            const trainNumber = parseInt(row.trip_headsign || "", 10);
+            const routeId = row.route_id || "";
+            
+            // TA LOGIQUE DE DÉTERMINATION DU TYPE
+            let type = 'ter'; // Par défaut
+
+            if (routeId.includes('OUIGO') || (trainNumber >= 7600 && trainNumber <= 7999)) {
+                type = 'ouigo_gv';
+            } else if (trainNumber >= 4000 && trainNumber <= 4699) {
+                type = 'ouigo_classique';
+            } else if (routeId.includes('INTERCITES') || (trainNumber >= 3000 && trainNumber <= 5999)) {
+                type = 'intercites';
+            } else if (routeId.includes('TGV') || String(trainNumber).length === 4) {
+                type = 'tgv_inoui';
+            }
+
+            return {
+                trip_id: row.trip_id,
+                route_id: row.route_id,
+                service_id: row.service_id,
+                trip_headsign: row.trip_headsign,
+                train_number: row.trip_headsign,
+                train_type: type // C'est ici que la colonne se génère !
+            };
+        }
     },
     calendar_dates: {
         file: 'calendar_dates.txt',
@@ -78,8 +95,46 @@ const GTFS_TABLES = {
             drop_off_type: row.drop_off_type ? parseInt(row.drop_off_type) : null,
             shape_dist_traveled: row.shape_dist_traveled ? parseFloat(row.shape_dist_traveled) : null
         })
+    },
+    tarifs_tgv: {
+        file: 'tarifs-tgv-inoui-ouigo.json',
+        uniqueKey: 'id',
+        transform: (row) => {
+            // Mapping pour que le nom du JSON corresponde au type du trajet
+            let type = 'ter';
+            if (row.transporteur === 'OUIGO') {
+                // On peut affiner ici si le JSON précise "Classique"
+                type = row.prix_minimum < 15 ? 'ouigo_classique' : 'ouigo_gv';
+            } else if (row.transporteur === 'TGV INOUI') {
+                type = 'tgv_inoui';
+            } else if (row.transporteur === 'INTERCITES') {
+                type = 'intercites';
+            }
+
+            return {
+                transporteur: row.transporteur,
+                train_type: type,
+                uic_depart: row.gare_origine_code_uic,
+                uic_arrivee: row.gare_destination_code_uic,
+                profil_tarifaire: row.profil_tarifaire,
+                prix_min: row.prix_minimum,
+                prix_max: row.prix_maximum
+            };
+        }
     }
 };
+
+// Fonction utilitaire pour le mapping des tarifs
+function mapCommercialToType(transporteur, prix) {
+    if (transporteur === 'OUIGO') {
+        // Si le prix mini est très bas, c'est souvent du classique, 
+        // mais l'idéal est de se baser sur le transporteur exact du JSON
+        return prix < 15 ? 'ouigo_classique' : 'ouigo_gv';
+    }
+    if (transporteur === 'TGV INOUI') return 'tgv_inoui';
+    if (transporteur === 'INTERCITES') return 'intercites';
+    return 'ter';
+}
 
 // Fonction pour formater les dates YYYYMMDD vers YYYY-MM-DD
 function formatDate(dateStr) {
