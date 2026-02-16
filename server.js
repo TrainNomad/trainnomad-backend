@@ -15,72 +15,69 @@ const supabase = createClient(
 
 // ==================== CONSTANTES MATHÉMATIQUES ====================
 const TRANSFER_CONSTRAINTS = {
-    t_min: 5,      // Temps minimum de correspondance (minutes)
-    t_max: 360      // Temps maximum d'attente (6 heures)
+    t_min: 5,
+    t_max: 360
 };
 
-// ==================== UTILITAIRES MATHÉMATIQUES ====================
+// ==================== UTILITAIRES ====================
 
-/**
- * Convertit un horaire HH:MM:SS en minutes depuis minuit
- * Utilisé pour les calculs de durée et de contraintes temporelles
- */
 function timeToMinutes(timeStr) {
     const [h, m] = timeStr.split(':').map(Number);
     return h * 60 + m;
 }
 
-/**
- * Calcule la durée entre deux horaires
- * Formule: Δt = T_arr - T_dep (en gérant le passage de minuit)
- */
 function calculateDuration(T_dep, T_arr) {
     try {
         const depMinutes = timeToMinutes(T_dep);
         const arrMinutes = timeToMinutes(T_arr);
-        
         let duration = arrMinutes - depMinutes;
-        if (duration < 0) duration += 24 * 60; // Passage minuit
-        
+        if (duration < 0) duration += 24 * 60;
         const hours = Math.floor(duration / 60);
         const minutes = duration % 60;
-        
         return `${hours}h${minutes.toString().padStart(2, '0')}`;
     } catch (e) {
         return 'N/A';
     }
 }
 
-/**
- * Vérifie la CONDITION B: Contrainte temporelle de correspondance
- * T_arr1 + t_min ≤ T_dep2
- */
-function isValidTransferTime(T_arr1, T_dep2, t_min = TRANSFER_CONSTRAINTS.t_min) {
-    const arr1Minutes = timeToMinutes(T_arr1);
-    const dep2Minutes = timeToMinutes(T_dep2);
-    
-    let waitTime = dep2Minutes - arr1Minutes;
-    if (waitTime < 0) waitTime += 24 * 60; // Passage minuit
-    
-    return waitTime;
-}
+function deduplicateTrains(trains) {
+    const trainMap = new Map();
 
-/**
- * Vérifie la CONDITION C: Optimisation du temps d'attente
- * T_dep2 - T_arr1 ≤ t_max
- */
-function isWithinMaxWaitTime(waitTimeMinutes, t_max = TRANSFER_CONSTRAINTS.t_max) {
-    return waitTimeMinutes <= t_max;
+    trains.forEach(train => {
+        const depTime = train.departure_time;
+        const [hours, minutes] = depTime.split(':').map(Number);
+        const roundedMinutes = Math.floor(minutes / 5) * 5;
+        const key = `${train.departure_station}-${hours}:${roundedMinutes.toString().padStart(2, '0')}`;
+
+        const existing = trainMap.get(key);
+
+        if (!existing) {
+            trainMap.set(key, train);
+        } else {
+            const existingDuration = timeToMinutes(existing.duration.replace('h', ':'));
+            const currentDuration = timeToMinutes(train.duration.replace('h', ':'));
+
+            if (train.type === 'direct' && existing.type !== 'direct') {
+                trainMap.set(key, train);
+            } else if (existing.type === 'direct' && train.type !== 'direct') {
+                // Garder l'existant
+            } else if (currentDuration < existingDuration) {
+                trainMap.set(key, train);
+            }
+        }
+    });
+
+    return Array.from(trainMap.values());
 }
 
 // ==================== ROUTES ====================
 
 app.get('/', (req, res) => {
     res.json({
-        message: '✅ TrainNomad Backend - Version Mathématique',
+        message: '✅ TrainNomad Backend',
         status: 'OK',
         timestamp: new Date().toISOString(),
-        version: '6.0 - Formules Mathématiques de Correspondance',
+        version: '7.0',
         constraints: TRANSFER_CONSTRAINTS
     });
 });
@@ -89,27 +86,21 @@ app.get('/health', async (req, res) => {
     try {
         const checks = {};
         const tables = ['stops', 'routes', 'trips', 'stop_times', 'calendar_dates'];
-        
+
         for (const table of tables) {
             try {
-                const { count } = await supabase.from(table).select('*', { count: 'exact', head: true });
+                const { count } = await supabase
+                    .from(table)
+                    .select('*', { count: 'exact', head: true });
                 checks[table] = count;
             } catch (e) {
                 checks[table] = `Error: ${e.message}`;
             }
         }
 
-        res.json({
-            status: 'healthy',
-            database: 'connected',
-            tables: checks
-        });
+        res.json({ status: 'healthy', database: 'connected', tables: checks });
     } catch (error) {
-        res.status(500).json({
-            status: 'unhealthy',
-            database: 'error',
-            error: error.message
-        });
+        res.status(500).json({ status: 'unhealthy', database: 'error', error: error.message });
     }
 });
 
@@ -117,10 +108,10 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/trains', async (req, res) => {
     try {
-        const { 
-            from, 
-            to, 
-            date, 
+        const {
+            from,
+            to,
+            date,
             startTime = "00:00:00",
             limit = 50,
             minTransferTime = 5,
@@ -131,28 +122,47 @@ app.get('/api/trains', async (req, res) => {
             return res.status(400).json({ error: "Paramètres from, to et date requis" });
         }
 
-        console.log(`🔍 Calcul mathématique : ${from} → ${to} le ${date}`);
+        console.log(`🔍 Recherche : ${from} → ${to} le ${date}`);
 
-        // 1. Identification des IDs des gares (Indispensable pour la fonction SQL)
-        const { data: stops } = await supabase
+        // 1. Récupération des IDs de gares
+        const { data: stopsData, error: stopsError } = await supabase
             .from('stops')
             .select('stop_id, stop_name')
             .or(`stop_name.ilike.%${from}%,stop_name.ilike.%${to}%`);
 
-        const G_A_ids = stops
-            .filter(s => s.stop_name.toLowerCase().includes(from.toLowerCase()))
-            .map(s => String(s.stop_id)); // On repasse en String pour accepter les préfixes "StopArea:"
-
-        const G_B_ids = stops
-            .filter(s => s.stop_name.toLowerCase().includes(to.toLowerCase()))
-            .map(s => String(s.stop_id)); // Idem ici
-
-        if (G_A_ids.length === 0 || G_B_ids.length === 0) {
-            return res.json({ success: false, error: "Gare de départ ou d'arrivée introuvable" });
+        // ✅ Protection contre null/undefined
+        if (stopsError) {
+            console.error('❌ Erreur stops:', stopsError);
+            return res.status(500).json({ success: false, error: `Erreur base de données: ${stopsError.message}` });
         }
 
-        // 2. APPEL DE LA FORMULE (RPC)
-        // On envoie les données brutes à PostgreSQL qui traite les millions de lignes
+        if (!stopsData || !Array.isArray(stopsData)) {
+            console.error('❌ stopsData est null ou undefined');
+            return res.status(500).json({ success: false, error: "Impossible de récupérer les gares" });
+        }
+
+        if (stopsData.length === 0) {
+            return res.json({ success: false, error: "Aucune gare trouvée pour ces noms" });
+        }
+
+        const G_A_ids = stopsData
+            .filter(s => s.stop_name && s.stop_name.toLowerCase().includes(from.toLowerCase()))
+            .map(s => String(s.stop_id));
+
+        const G_B_ids = stopsData
+            .filter(s => s.stop_name && s.stop_name.toLowerCase().includes(to.toLowerCase()))
+            .map(s => String(s.stop_id));
+
+        console.log(`📍 Gares départ trouvées: ${G_A_ids.length} | Gares arrivée: ${G_B_ids.length}`);
+
+        if (G_A_ids.length === 0) {
+            return res.json({ success: false, error: `Gare de départ introuvable: "${from}"` });
+        }
+        if (G_B_ids.length === 0) {
+            return res.json({ success: false, error: `Gare d'arrivée introuvable: "${to}"` });
+        }
+
+        // 2. Appel RPC
         const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
             p_from_ids: G_A_ids,
             p_to_ids: G_B_ids,
@@ -162,34 +172,41 @@ app.get('/api/trains', async (req, res) => {
             p_t_max: parseInt(maxWaitTime)
         });
 
-        if (rpcError) throw rpcError;
+        if (rpcError) {
+            console.error('❌ Erreur RPC:', rpcError);
+            throw rpcError;
+        }
 
-        // 3. Formatage pour le front-end
+        // ✅ Protection contre results null
+        if (!results || !Array.isArray(results)) {
+            return res.json({ success: true, count: 0, from, to, date, trains: [] });
+        }
+
+        // 3. Formatage
         const formattedTrains = results.map(t => ({
             type: t.journey_type,
             departure_station: t.departure_station,
             arrival_station: t.arrival_station,
             departure_time: t.departure_time,
             arrival_time: t.arrival_time,
-            // Conversion mathématique de la durée stockée en minutes
             duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
             details: {
-                steps: t.stops_list, // Liste des gares de passage
-                train_names: t.trips_list // Noms des trains empruntés
+                steps: t.stops_list,
+                train_names: t.trips_list
             }
         }));
 
-        // 4. Déduplication finale (Optionnel mais recommandé)
+        // 4. Déduplication
         const finalResults = deduplicateTrains(formattedTrains).slice(0, parseInt(limit));
 
-        console.log(`✅ ${finalResults.length} trajets calculés avec succès.`);
+        console.log(`✅ ${finalResults.length} trajets trouvés`);
 
         res.json({
             success: true,
             count: finalResults.length,
-            from: from,
-            to: to,
-            date: date,
+            from,
+            to,
+            date,
             trains: finalResults
         });
 
@@ -198,83 +215,6 @@ app.get('/api/trains', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
-
-// // 3. Appel de la formule mathématique dans Supabase
-// const { data: results, error: rpcError } = await supabase.rpc('find_optimized_trains', {
-//     p_from_ids: G_A_ids,
-//     p_to_ids: G_B_ids,
-//     p_date: date,
-//     p_start_time: startTime,
-//     p_t_min: parseInt(minTransferTime),
-//     p_t_max: parseInt(maxWaitTime)
-// });
-
-// if (rpcError) throw rpcError;
-
-// // 4. Formatage simple pour le front-end
-// const formattedTrains = results.map(t => ({
-//     type: t.journey_type,
-//     departure_station: t.departure_station,
-//     arrival_station: t.arrival_station,
-//     departure_time: t.departure_time,
-//     arrival_time: t.arrival_time,
-//     duration: `${Math.floor(t.total_duration_min / 60)}h${(t.total_duration_min % 60).toString().padStart(2, '0')}`,
-//     details: {
-//         stops: t.stops_list,
-//         trains: t.trips_list
-//     }
-// }));
-
-// res.json({ success: true, count: formattedTrains.length, trains: formattedTrains });
-
-// ==================== FONCTIONS AUXILIAIRES ====================
-
-function groupByTripId(stops) {
-    const grouped = {};
-    if (!stops) return grouped;
-    
-    stops.forEach(stop => {
-        if (!grouped[stop.trip_id]) {
-            grouped[stop.trip_id] = [];
-        }
-        grouped[stop.trip_id].push(stop);
-    });
-    return grouped;
-}
-
-/**
- * Déduplique les trajets en gardant le meilleur par créneau de 5 minutes
- */
-function deduplicateTrains(trains) {
-    const trainMap = new Map();
-    
-    trains.forEach(train => {
-        const depTime = train.departure_time;
-        const [hours, minutes] = depTime.split(':').map(Number);
-        const roundedMinutes = Math.floor(minutes / 5) * 5;
-        const key = `${train.departure_station}-${hours}:${roundedMinutes.toString().padStart(2, '0')}`;
-        
-        const existing = trainMap.get(key);
-        
-        if (!existing) {
-            trainMap.set(key, train);
-        } else {
-            // Priorité: 1. Direct, 2. Plus rapide
-            const existingDuration = timeToMinutes(existing.duration.replace('h', ':'));
-            const currentDuration = timeToMinutes(train.duration.replace('h', ':'));
-            
-            if (train.type === 'direct' && existing.type !== 'direct') {
-                trainMap.set(key, train);
-            } else if (existing.type === 'direct' && train.type !== 'direct') {
-                // Garder l'existant
-            } else if (currentDuration < existingDuration) {
-                trainMap.set(key, train);
-            }
-        }
-    });
-    
-    return Array.from(trainMap.values());
-}
 
 // ==================== AUTRES ROUTES ====================
 
@@ -287,6 +227,11 @@ app.get('/api/available-dates', async (req, res) => {
             .order('date', { ascending: true });
 
         if (error) throw error;
+
+        // ✅ Protection contre null
+        if (!dates || !Array.isArray(dates)) {
+            return res.json({ success: true, dateRange: null, byMonth: {}, sampleDates: [] });
+        }
 
         const uniqueDates = [...new Set(dates.map(d => d.date))];
         const minDate = uniqueDates[0];
@@ -301,21 +246,14 @@ app.get('/api/available-dates', async (req, res) => {
 
         res.json({
             success: true,
-            dateRange: {
-                first: minDate,
-                last: maxDate,
-                totalDays: uniqueDates.length
-            },
-            byMonth: byMonth,
+            dateRange: { first: minDate, last: maxDate, totalDays: uniqueDates.length },
+            byMonth,
             sampleDates: uniqueDates.slice(0, 10),
             message: `Données disponibles du ${minDate} au ${maxDate}`
         });
 
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -338,17 +276,16 @@ app.get('/api/stations', async (req, res) => {
 
         res.json({
             success: true,
-            count: data.length,
-            stations: data
+            count: data ? data.length : 0,
+            stations: data || []
         });
 
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ==================== 404 & ERROR HANDLERS ====================
 
 app.use((req, res) => {
     res.status(404).json({
@@ -376,10 +313,6 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Serveur démarré sur le port ${PORT}`);
-    console.log(`📐 Formules mathématiques activées:`);
-    console.log(`   A. Condition de lieu: G_C ∈ S(Train1) ∩ E(Train2)`);
-    console.log(`   B. Condition de temps: T_arr1 + t_min ≤ T_dep2`);
-    console.log(`   C. Condition d'optimisation: T_dep2 - T_arr1 ≤ t_max`);
     console.log(`   t_min = ${TRANSFER_CONSTRAINTS.t_min} min`);
     console.log(`   t_max = ${TRANSFER_CONSTRAINTS.t_max} min`);
 });
